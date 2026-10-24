@@ -1,9 +1,6 @@
 {
   "domain": "tauron_amiplus",
   "name": "Tauron AMIplus",
-  "categories": [
-    "energy.meters_monitoring"
-  ],
   "codeowners": [
     "@skoczo",
     "@PiotrMachowski"
