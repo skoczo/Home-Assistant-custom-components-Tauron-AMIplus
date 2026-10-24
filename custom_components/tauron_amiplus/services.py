@@ -72,7 +72,7 @@ class ClearCacheService:
         if config_entry is None:
             _LOGGER.error(f"Config entry not found: {config_entry_id}")
             return
-        config_entry.runtime_data.coordinator.connector.clear_cache()
+        await config_entry.runtime_data.coordinator.connector.async_clear_cache()
 
 
 def register_all_services(hass: HomeAssistant) -> None:

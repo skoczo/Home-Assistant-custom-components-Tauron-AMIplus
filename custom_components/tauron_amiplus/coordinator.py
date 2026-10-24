@@ -29,9 +29,16 @@ class TauronAmiplusUpdateCoordinator(DataUpdateCoordinator[TauronAmiplusRawData]
             show_configurable: bool = False,
             show_configurable_date: datetime.date | None = None,
             store_statistics: bool = False,
+            config_entry=None,
     ):
-        super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=DEFAULT_UPDATE_INTERVAL,
-                         update_method=self.update_method)
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=DOMAIN,
+            update_interval=DEFAULT_UPDATE_INTERVAL,
+            update_method=self.update_method,
+            config_entry=config_entry,
+        )
         self.connector = TauronAmiplusConnector(username, password, meter_id, hass, config_entry_id, show_generation, show_12_months,
                                                 show_balanced, show_balanced_year, show_configurable,
                                                 show_configurable_date)
@@ -52,6 +59,7 @@ class TauronAmiplusUpdateCoordinator(DataUpdateCoordinator[TauronAmiplusRawData]
             self.log("Starting statistics update")
             await self.generate_statistics(data)
             self.log("Updated all statistics")
+        await self.connector.async_save_cache()
         return data
 
     async def generate_statistics(self, data):

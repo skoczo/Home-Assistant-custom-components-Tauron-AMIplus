@@ -37,42 +37,80 @@ class TauronAmiplusStatisticsUpdater:
         show_generation = entry.options.get(CONF_SHOW_GENERATION, False)
         show_balanced = entry.options.get(CONF_SHOW_BALANCED, False)
 
-        connector = TauronAmiplusConnector(username, password, meter_id, hass=hass, config_entry_id=entry.entry_id, show_generation=show_generation,
-                                           show_balanced=show_balanced)
-        statistics_updater = TauronAmiplusStatisticsUpdater(hass, connector, meter_id, meter_name, show_generation, show_balanced)
+        connector = TauronAmiplusConnector(
+            username,
+            password,
+            meter_id,
+            hass=hass,
+            config_entry_id=entry.entry_id,
+            show_generation=show_generation,
+            show_balanced=show_balanced,
+        )
+        statistics_updater = TauronAmiplusStatisticsUpdater(
+            hass, connector, meter_id, meter_name, show_generation, show_balanced
+        )
 
         data = await connector.get_raw_data()
-        start_date = datetime.datetime.combine(start_date,
-                                               datetime.time(tzinfo=datetime.datetime.now().astimezone().tzinfo))
+        start_datetime = datetime.datetime.combine(
+            start_date, datetime.time(0, 0, tzinfo=get_time_zone("Europe/Warsaw"))
+        )
         if data is not None:
-            await statistics_updater.update_all(data, start_date)
+            await statistics_updater.update_all(data, start_datetime)
+            await connector.async_save_cache()
 
     async def update_all(self, last_data: TauronAmiplusRawData, start_date: datetime.datetime = None) -> None:
-        if last_data.consumption is None or last_data.consumption.json_last_30_days_hourly is None:
+        if last_data.consumption is None:
             return
-        raw_data = {CONST_CONSUMPTION: last_data.consumption.json_last_30_days_hourly["data"]["allData"]}
-        zones = last_data.consumption.json_last_30_days_hourly["data"]["zonesName"]
-        if self.show_generation or self.show_balanced:
-            if last_data.generation is None or last_data.generation.json_last_30_days_hourly is None:
-                return
-            raw_data[CONST_GENERATION] = last_data.generation.json_last_30_days_hourly["data"]["allData"]
+
+        zones = {}
+        if last_data.consumption.json_daily and "data" in last_data.consumption.json_daily:
+            zones = last_data.consumption.json_daily["data"].get("zonesName", {})
+        if not zones and last_data.consumption.json_monthly and "data" in last_data.consumption.json_monthly:
+            zones = last_data.consumption.json_monthly["data"].get("zonesName", {})
 
         all_stat_ids = await self.prepare_stats_ids(zones)
 
-        if (start_date is not None
-                or not all([self.are_stats_up_to_date(v["last_stats_end"]) for v in all_stat_ids.values()])):
-            now = datetime.datetime.now()
-            if start_date is None:
-                start_range = (now - datetime.timedelta(365)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        warsaw_tz = get_time_zone("Europe/Warsaw")
+        now = datetime.datetime.now(warsaw_tz)
+
+        if start_date is not None:
+            fetch_from = start_date.astimezone(warsaw_tz).date()
+            start_date_utc = as_utc(start_date)
+            for s, v in all_stat_ids.items():
+                if v["last_stats_time"] is not None and v["last_stats_time"] >= start_date_utc:
+                    v["sum"] = 0.0
+                    v["last_stats_time"] = None
+        else:
+            has_all_stats = all(v["last_stats_time"] is not None for v in all_stat_ids.values())
+            if has_all_stats:
+                min_last_time = min(v["last_stats_time"] for v in all_stat_ids.values())
+                min_last_date = min_last_time.astimezone(warsaw_tz).date()
+                fetch_from = min_last_date - datetime.timedelta(days=1)
             else:
-                start_range = start_date.replace(tzinfo=None)
-            data_consumption = await self.connector.get_raw_values_daily_for_range(start_range, now, False)
-            if data_consumption is not None:
-                raw_data[CONST_CONSUMPTION] = data_consumption["data"]["allData"]
-            if self.show_generation or self.show_balanced:
-                data_generation = await self.connector.get_raw_values_daily_for_range(start_range, now, True)
-                if data_generation is not None:
-                    raw_data[CONST_GENERATION] = data_generation["data"]["allData"]
+                # First run or missing stats: fetch default range (30 days back)
+                fetch_from = (now - datetime.timedelta(days=30)).date()
+
+        # Guard against excessively old query ranges
+        max_history_date = (now - datetime.timedelta(days=365)).date()
+        if fetch_from < max_history_date:
+            fetch_from = max_history_date
+
+        fetch_to = now.date()
+        self.log(f"Fetching raw daily energy data for range: {fetch_from} to {fetch_to}")
+
+        data_consumption = await self.connector.get_raw_values_daily_for_range(fetch_from, fetch_to, False)
+        if data_consumption is None or not data_consumption.get("data", {}).get("allData"):
+            self.log(f"No consumption data received for range {fetch_from} - {fetch_to}")
+            return
+
+        raw_data = {CONST_CONSUMPTION: data_consumption["data"]["allData"]}
+
+        if self.show_generation or self.show_balanced:
+            data_generation = await self.connector.get_raw_values_daily_for_range(fetch_from, fetch_to, True)
+            if data_generation is not None and data_generation.get("data", {}).get("allData"):
+                raw_data[CONST_GENERATION] = data_generation["data"]["allData"]
+            else:
+                raw_data[CONST_GENERATION] = []
 
         if self.show_balanced:
             balanced_consumption, balanced_generation = self.prepare_balanced_raw_data(raw_data)
@@ -80,19 +118,16 @@ class TauronAmiplusStatisticsUpdater:
             raw_data[f"{CONST_BALANCED}_{CONST_GENERATION}"] = balanced_generation
 
         for s, v in all_stat_ids.items():
-            if v["last_stats_end"] is not None:
-                stat = await self.get_stats(raw_data[v["data_source"]], s)
-                v["sum"] = stat[s][0]["sum"]
-                start = stat[s][0]["start"]
-                if isinstance(start, float):
-                    start = utc_from_timestamp(start)
-                if start_date is not None and start > start_date:
-                    start = None
-                    v["sum"] = 0
-                v["last_stats_time"] = start
-
-        for s, v in all_stat_ids.items():
-            await self.update_stats(s, v["name"], v["sum"], v["last_stats_time"], v["zone"], raw_data[v["data_source"]])
+            if v["data_source"] not in raw_data:
+                continue
+            await self.update_stats(
+                s,
+                v["name"],
+                v["sum"],
+                v["last_stats_time"],
+                v["zone"],
+                raw_data[v["data_source"]],
+            )
 
     async def prepare_stats_ids(self, zones):
         suffixes = [{
@@ -138,14 +173,31 @@ class TauronAmiplusStatisticsUpdater:
                 "name": self.get_stats_name(s["name"]),
                 "zone": s["zone"],
                 "data_source": s["data"],
-                "sum": 0,
+                "sum": 0.0,
                 "last_stats_time": None,
                 "last_stats_end": None
             }
             for s in suffixes
         }
         for k, v in all_stat_ids.items():
-            v["last_stats_end"] = await self.get_last_stats_date(k)
+            last_stat = await self.get_last_stats(k)
+            if k in last_stat and len(last_stat[k]) > 0:
+                row = last_stat[k][0]
+                v["sum"] = float(row.get("sum", 0.0) or 0.0)
+                start = row.get("start")
+                if isinstance(start, (int, float)):
+                    start = utc_from_timestamp(start)
+                elif isinstance(start, datetime.datetime) and start.tzinfo is None:
+                    start = as_utc(start)
+                v["last_stats_time"] = start
+
+                end = row.get("end")
+                if isinstance(end, (int, float)):
+                    end = utc_from_timestamp(end)
+                elif isinstance(end, datetime.datetime) and end.tzinfo is None:
+                    end = as_utc(end)
+                v["last_stats_end"] = end
+
         return all_stat_ids
 
     def get_stats_id(self, suffix):
@@ -162,21 +214,28 @@ class TauronAmiplusStatisticsUpdater:
         return (as_utc(now) - last_stats_end).days < 30
 
     @staticmethod
-    def prepare_balanced_raw_data(raw_data) -> (dict, dict):
-        consumption_data = raw_data[CONST_CONSUMPTION]
-        generation_data = raw_data[CONST_GENERATION]
-        if len(consumption_data) != len(generation_data):
-            return {}, {}
+    def prepare_balanced_raw_data(raw_data) -> (list, list):
+        consumption_data = raw_data.get(CONST_CONSUMPTION, [])
+        generation_data = raw_data.get(CONST_GENERATION, [])
+        if not consumption_data or not generation_data:
+            return [], []
+
+        gen_by_time = {(g["Date"], g["Hour"]): g for g in generation_data}
+
         balanced_consumption = []
         balanced_generation = []
 
-        for consumption, generation in zip(consumption_data, generation_data):
+        for consumption in consumption_data:
+            key = (consumption["Date"], consumption["Hour"])
+            if key not in gen_by_time:
+                continue
+            generation = gen_by_time[key]
             value_consumption = float(consumption["EC"])
             value_generation = float(generation["EC"])
             balance = value_consumption - value_generation
             if balance > 0:
                 output_consumption = {
-                    "EC": f'{balance}',
+                    "EC": f"{balance}",
                     "Date": consumption["Date"],
                     "Hour": consumption["Hour"],
                     "Zone": consumption["Zone"],
@@ -195,7 +254,7 @@ class TauronAmiplusStatisticsUpdater:
                     "Zone": consumption["Zone"],
                 }
                 output_generation = {
-                    "EC": f'{-balance}',
+                    "EC": f"{-balance}",
                     "Date": generation["Date"],
                     "Hour": generation["Hour"],
                     "Zone": generation["Zone"],
@@ -224,23 +283,29 @@ class TauronAmiplusStatisticsUpdater:
                 continue
             usage = float(raw_hour["EC"])
             if zone_id is not None and raw_hour["Zone"] != zone_id:
-                usage = 0
+                usage = 0.0
             current_sum += usage
             stats = {
                 "start": start,
                 "state": usage,
-                "sum": current_sum
+                "sum": current_sum,
             }
             statistic_data.append(stats)
-        async_add_external_statistics(self.hass, metadata, statistic_data)
-        self.log(f"Updated {len(statistic_data)} entries for statistic: {statistic_id} ")
+
+        if statistic_data:
+            async_add_external_statistics(self.hass, metadata, statistic_data)
+            self.log(f"Added {len(statistic_data)} new entries for statistic: {statistic_id}")
+        else:
+            self.log(f"No new entries to update for statistic: {statistic_id}")
 
     async def get_last_stats_date(self, statistic_id):
         last_stats = await self.get_last_stats(statistic_id)
         if statistic_id in last_stats and len(last_stats[statistic_id]) > 0:
             end = last_stats[statistic_id][0]["end"]
-            if isinstance(end, float):
+            if isinstance(end, (int, float)):
                 end = utc_from_timestamp(end)
+            elif isinstance(end, datetime.datetime) and end.tzinfo is None:
+                end = as_utc(end)
             return end
         return None
 
@@ -260,6 +325,10 @@ class TauronAmiplusStatisticsUpdater:
     @staticmethod
     def get_time(raw_hour):
         zone = get_time_zone("Europe/Warsaw")
-        date = raw_hour["Date"]
+        date_str = raw_hour["Date"]
         hour = int(raw_hour["Hour"]) - 1
-        return datetime.datetime.strptime(f"{date} {hour}:00", "%Y-%m-%d %H:%M").replace(tzinfo=zone)
+        if hour < 24:
+            dt = datetime.datetime.strptime(f"{date_str} {hour:02d}:00", "%Y-%m-%d %H:%M").replace(tzinfo=zone)
+        else:
+            dt = datetime.datetime.strptime(f"{date_str} 23:00", "%Y-%m-%d %H:%M").replace(tzinfo=zone) + datetime.timedelta(hours=1)
+        return as_utc(dt)

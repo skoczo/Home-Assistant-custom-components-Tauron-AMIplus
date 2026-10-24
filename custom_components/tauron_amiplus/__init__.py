@@ -84,6 +84,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: TauronAmiplusConf
         show_configurable=show_configurable,
         show_configurable_date=show_configurable_date,
         store_statistics=store_statistics,
+        config_entry=config_entry,
     )
     config_entry.runtime_data = TauronAmiplusRuntimeData(tauron_amiplus_update_coordinator)
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
@@ -95,6 +96,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: TauronAmiplusConf
 
 async def async_unload_entry(hass, config_entry) -> bool:
     """Unload a config entry."""
+    if hasattr(config_entry, "runtime_data") and config_entry.runtime_data is not None:
+        await config_entry.runtime_data.coordinator.connector.async_save_cache()
     await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)
     return True
 

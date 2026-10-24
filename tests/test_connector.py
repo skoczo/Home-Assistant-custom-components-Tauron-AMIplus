@@ -13,8 +13,38 @@ def test_daily_data_cache():
     assert cache.get_value(day, generation=False) == data
     assert cache.get_value(day, generation=True) is None
 
+    # Test delete_older_than
+    old_day = datetime.datetime(2026, 10, 1)
+    cache.add_value(old_day, generation=False, value={"old": 1})
+    cache.delete_older_than(datetime.datetime(2026, 10, 15))
+    assert cache.get_value(old_day, generation=False) is None
+    assert cache.get_value(day, generation=False) == data
+
     cache.clear()
     assert cache.get_value(day, generation=False) is None
+
+
+async def test_daily_data_cache_persistence(mocker):
+    mock_store = mocker.AsyncMock()
+    mock_store.async_load.return_value = {
+        "consumption": {"2026-10-20": {"EC": 5}},
+        "generation": {"2026-10-20": {"EC": 2}},
+    }
+
+    cache = DailyDataCache("test_meter")
+    cache._store = mock_store
+
+    await cache.async_load()
+    assert cache.get_value(datetime.date(2026, 10, 20), generation=False) == {"EC": 5}
+    assert cache.get_value(datetime.date(2026, 10, 20), generation=True) == {"EC": 2}
+
+    cache.add_value(datetime.date(2026, 10, 21), generation=False, value={"EC": 10})
+    await cache.async_save()
+
+    mock_store.async_save.assert_awaited_once()
+    saved_data = mock_store.async_save.call_args[0][0]
+    assert "2026-10-21" in saved_data["consumption"]
+    assert saved_data["consumption"]["2026-10-21"] == {"EC": 10}
 
 
 def test_get_meters_parser():
@@ -28,3 +58,88 @@ def test_get_meters_parser():
     assert len(meters) == 2
     assert meters[0] == {"meter_id": "12345678", "meter_name": "Licznik Dom (12345678)", "meter_type": "G11"}
     assert meters[1] == {"meter_id": "87654321", "meter_name": "Licznik Firma (87654321)", "meter_type": "WO"}
+
+
+async def test_get_raw_values_daily_for_range(mocker):
+    connector = TauronAmiplusConnector("user", "pass", "12345")
+
+    day1 = datetime.date(2026, 10, 20)
+    day2 = datetime.date(2026, 10, 21)
+
+    # Preload day 1 into cache
+    connector._cache.add_value(
+        day1,
+        generation=False,
+        value={
+            "data": {
+                "allData": [{"Date": "2026-10-20", "Hour": 1, "EC": "2.0", "Zone": "1", "Status": "0"}],
+                "sum": 2.0,
+                "zones": {"1": 2.0},
+                "zonesName": {"1": "G11"},
+            }
+        },
+    )
+
+    # Mock chart values fetch only for uncached day 2
+    mock_chart_values = mocker.patch.object(
+        connector,
+        "get_chart_values",
+        return_value={
+            "data": {
+                "allData": [{"Date": "2026-10-21", "Hour": 1, "EC": "3.0", "Zone": "1", "Status": "0"}],
+                "sum": 3.0,
+                "zones": {"1": 3.0},
+                "zonesName": {"1": "G11"},
+            }
+        },
+    )
+
+    data = await connector.get_raw_values_daily_for_range(day1, day2, generation=False)
+    assert data is not None
+    assert len(data["data"]["allData"]) == 2
+    assert data["data"]["sum"] == 5.0
+    assert data["data"]["zones"] == {"1": 5.0}
+    # get_chart_values should only be called once (for day 2), because day 1 was a cache hit!
+    mock_chart_values.assert_called_once()
+
+
+async def test_get_data_set_optimizations(mocker):
+    # Without show_balanced
+    connector = TauronAmiplusConnector("user", "pass", "12345", show_balanced=False)
+    mocker.patch.object(connector, "get_reading", return_value={"reading": 1})
+    mocker.patch.object(connector, "get_values_daily", return_value=({"daily": 1}, "2026-10-24"))
+    mocker.patch.object(connector, "get_values_monthly", return_value={"monthly": 1})
+    mocker.patch.object(connector, "get_values_yearly", return_value={"yearly": 1})
+    mock_month_hourly = mocker.patch.object(connector, "get_values_month_hourly", return_value={"month_hourly": 1})
+    mock_30_days = mocker.patch.object(connector, "get_values_last_30_days_hourly", return_value={"30_days": 1})
+
+    dataset, _ = await connector.get_data_set(generation=False)
+    # 30-day fetch is never called
+    mock_30_days.assert_not_called()
+    # Month hourly is not called when show_balanced=False
+    mock_month_hourly.assert_not_called()
+    assert dataset.json_month_hourly is None
+    assert dataset.json_last_30_days_hourly is None
+
+    # With show_balanced=True
+    connector_balanced = TauronAmiplusConnector("user", "pass", "12345", show_balanced=True)
+    mocker.patch.object(connector_balanced, "get_reading", return_value={"reading": 1})
+    mocker.patch.object(connector_balanced, "get_values_daily", return_value=({"daily": 1}, "2026-10-24"))
+    mocker.patch.object(connector_balanced, "get_values_monthly", return_value={"monthly": 1})
+    mocker.patch.object(connector_balanced, "get_values_yearly", return_value={"yearly": 1})
+    mock_month_hourly_b = mocker.patch.object(connector_balanced, "get_values_month_hourly", return_value={"month_hourly": 1})
+
+    dataset_b, _ = await connector_balanced.get_data_set(generation=False)
+    mock_month_hourly_b.assert_called_once()
+    assert dataset_b.json_month_hourly == {"month_hourly": 1}
+
+
+async def test_async_clear_cache(mocker):
+    connector = TauronAmiplusConnector("user", "pass", "12345")
+    mock_save = mocker.patch.object(connector._cache, "async_save", new_callable=mocker.AsyncMock)
+
+    connector._cache.add_value(datetime.date(2026, 10, 24), generation=False, value={"EC": 1})
+    await connector.async_clear_cache()
+
+    assert connector._cache.get_value(datetime.date(2026, 10, 24), generation=False) is None
+    mock_save.assert_awaited_once()

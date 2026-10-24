@@ -127,11 +127,12 @@ class TauronAmiplusConnector:
         self._show_configurable = show_configurable
         self._show_configurable_date = show_configurable_date
         self._session: ClientSession | None = None
-        self._cache = DailyDataCache(meter_id)
         self._hass = hass
         self._storage_key = f"{STORAGE_KEY_PREFIX}_{config_entry_id}" if config_entry_id is not None else None
+        self._cache = DailyDataCache(meter_id, hass, self._storage_key)
 
     async def get_raw_data(self) -> TauronAmiplusRawData:
+        await self._cache.async_load()
         data = TauronAmiplusRawData()
         # data.payments = await self.get_moj_tauron()
         data.tariff = await self.login()
@@ -142,6 +143,7 @@ class TauronAmiplusConnector:
         else:
             data.generation = TauronAmiplusDataSet()
         self._cache.delete_older_than(min(consumption_max_cache, generation_max_cache))
+        await self._cache.async_save()
         return data
 
     async def get_data_set(self, generation) -> Tuple[TauronAmiplusDataSet, datetime.datetime]:
@@ -150,10 +152,10 @@ class TauronAmiplusConnector:
         dataset.json_daily, dataset.daily_date = await self.get_values_daily(generation)
         dataset.json_monthly = await self.get_values_monthly(generation)
         dataset.json_yearly = await self.get_values_yearly(generation)
-        dataset.json_month_hourly = await self.get_values_month_hourly(generation)
-        dataset.json_last_30_days_hourly = await self.get_values_last_30_days_hourly(generation)
+        if self._show_balanced:
+            dataset.json_month_hourly = await self.get_values_month_hourly(generation)
         now = datetime.datetime.now()
-        cache_max = datetime.datetime.now() - datetime.timedelta(days=32)
+        cache_max = datetime.datetime.now() - datetime.timedelta(days=366)
         if self._show_12_months:
             dataset.json_last_12_months_hourly = await self.get_values_12_months_hourly(generation)
             cache_max = now.replace(year=now.year - 1) - datetime.timedelta(days=2)
@@ -292,6 +294,13 @@ class TauronAmiplusConnector:
 
     def clear_cache(self) -> None:
         self._cache.clear()
+
+    async def async_save_cache(self) -> None:
+        await self._cache.async_save()
+
+    async def async_clear_cache(self) -> None:
+        self.clear_cache()
+        await self._cache.async_save()
 
     @staticmethod
     def _get_meters(text: str) -> list:
@@ -554,11 +563,47 @@ class TauronAmiplusConnector:
 
 class DailyDataCache:
 
-    def __init__(self, meter_id):
-        self._consumption_data = dict()
-        self._generation_data = dict()
-        self._max_date = datetime.datetime.now() + datetime.timedelta(days=1)
+    def __init__(
+        self,
+        meter_id: str,
+        hass: HomeAssistant | None = None,
+        storage_key: str | None = None,
+    ):
+        self._consumption_data: dict[str, Any] = dict()
+        self._generation_data: dict[str, Any] = dict()
         self._meter_id = meter_id
+        self._hass = hass
+        self._storage_key = storage_key
+        self._store = (
+            Store(hass, STORAGE_VERSION, f"{storage_key}_daily_cache")
+            if hass is not None and storage_key is not None
+            else None
+        )
+        self._loaded = False
+        self._dirty = False
+
+    async def async_load(self) -> None:
+        if self._loaded or self._store is None:
+            return
+        stored = await self._store.async_load()
+        if stored:
+            self._consumption_data = stored.get("consumption", {})
+            self._generation_data = stored.get("generation", {})
+            self.log(
+                f"Loaded daily cache from storage: consumption={len(self._consumption_data)}, generation={len(self._generation_data)}"
+            )
+        self._loaded = True
+
+    async def async_save(self) -> None:
+        if not self._dirty or self._store is None:
+            return
+        data = {
+            "consumption": self._consumption_data,
+            "generation": self._generation_data,
+        }
+        await self._store.async_save(data)
+        self._dirty = False
+        self.log("Saved daily cache to storage")
 
     def __contains__(self, item: Tuple[str, bool]):
         date_str, generation = item
@@ -566,7 +611,7 @@ class DailyDataCache:
             return date_str in self._generation_data
         return date_str in self._consumption_data
 
-    def add_value(self, date: datetime.datetime, generation: bool, value):
+    def add_value(self, date: datetime.datetime | datetime.date, generation: bool, value):
         date_str = self._format_date(date)
         if value is None:
             return
@@ -574,10 +619,9 @@ class DailyDataCache:
             self._generation_data[date_str] = value
         else:
             self._consumption_data[date_str] = value
-        if self._max_date is None or self._max_date > date:
-            self._max_date = date
+        self._dirty = True
 
-    def get_value(self, date: datetime.datetime, generation: bool):
+    def get_value(self, date: datetime.datetime | datetime.date, generation: bool):
         date_str = self._format_date(date)
         if (date_str, generation) in self:
             if generation:
@@ -585,19 +629,30 @@ class DailyDataCache:
             return self._consumption_data[date_str]
         return None
 
-    def delete_older_than(self, date: datetime.datetime):
-        if date > self._max_date:
-            for d in [self._max_date + datetime.timedelta(days=x) for x in range((date - self._max_date).days)]:
-                self.delete_day(d)
-            self._max_date = date
+    def delete_older_than(self, cutoff_date: datetime.datetime | datetime.date):
+        cutoff_str = self._format_date(cutoff_date)
+        for d in list(self._consumption_data.keys()):
+            if d < cutoff_str:
+                self.delete_day_str(d)
+        for d in list(self._generation_data.keys()):
+            if d < cutoff_str:
+                self.delete_day_str(d)
 
-    def delete_day(self, date: datetime.datetime):
+    def delete_day(self, date: datetime.datetime | datetime.date):
         date_str = self._format_date(date)
-        self.log(f"Deleting data from cache for day: {date_str}")
+        self.delete_day_str(date_str)
+
+    def delete_day_str(self, date_str: str):
+        deleted = False
         if date_str in self._generation_data:
             self._generation_data.pop(date_str)
+            deleted = True
         if date_str in self._consumption_data:
             self._consumption_data.pop(date_str)
+            deleted = True
+        if deleted:
+            self._dirty = True
+            self.log(f"Deleting data from cache for day: {date_str}")
 
     def clear(self) -> None:
         self.log(
@@ -605,9 +660,10 @@ class DailyDataCache:
         )
         self._generation_data.clear()
         self._consumption_data.clear()
+        self._dirty = True
 
     @staticmethod
-    def _format_date(date):
+    def _format_date(date: datetime.datetime | datetime.date):
         return date.strftime("%Y-%m-%d")
 
     def log(self, msg):
