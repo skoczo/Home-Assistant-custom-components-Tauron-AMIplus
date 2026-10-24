@@ -7,6 +7,7 @@
 
 Home Assistant custom integration for retrieving energy consumption and generation data from Polish electrical utility DSO portal [TAURON eLicznik](https://elicznik.tauron-dystrybucja.pl).
 
+
 > **Note on maintenance:**  
 > This repository is a maintained continuation (fork) of the original component created by [Piotr Machowski](https://github.com/PiotrMachowski/Home-Assistant-custom-components-Tauron-AMIplus). As the upstream project has become inactive, this fork aims to ensure compatibility with modern Home Assistant versions (2025.x / 2026.x+), resolve outstanding bugs, and incorporate improvements contributed by the community.
 
