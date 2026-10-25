@@ -1,4 +1,5 @@
 """Update coordinator for TAURON sensors."""
+import copy
 import datetime
 import json
 import logging
@@ -132,6 +133,7 @@ class TauronAmiplusConnector:
         self._hass = hass
         self._storage_key = f"{STORAGE_KEY_PREFIX}_{config_entry_id}" if config_entry_id is not None else None
         self._cache = DailyDataCache(meter_id, hass, self._storage_key)
+        self._cycle_cache: dict[tuple[str, bool], dict | None] = {}
         self._cycle_cache_hits = 0
         self._cycle_downloads = 0
 
@@ -139,6 +141,7 @@ class TauronAmiplusConnector:
         start_fetch = time.monotonic()
         self._cycle_cache_hits = 0
         self._cycle_downloads = 0
+        self._cycle_cache.clear()
         await self._cache.async_load()
         data = TauronAmiplusRawData()
         # data.payments = await self.get_moj_tauron()
@@ -309,6 +312,7 @@ class TauronAmiplusConnector:
 
     def clear_cache(self) -> None:
         self._cache.clear()
+        self._cycle_cache.clear()
 
     async def async_save_cache(self) -> None:
         await self._cache.async_save()
@@ -439,6 +443,13 @@ class TauronAmiplusConnector:
             self.log(f"Cache hit for day {day_str}, generation: {generation}")
             return cached_data
 
+        cache_key = (day_str, generation)
+        if cache_key in self._cycle_cache:
+            self._cycle_cache_hits += 1
+            self.log(f"Cycle cache hit for day {day_str}, generation: {generation}")
+            cycle_data = self._cycle_cache[cache_key]
+            return copy.deepcopy(cycle_data) if cycle_data is not None else None
+
         self._cycle_downloads += 1
         payload = {
             "from": day_str,
@@ -463,8 +474,10 @@ class TauronAmiplusConnector:
             values["data"]["allData"] = [
                 d for d in values["data"]["allData"] if self.contains_data(d)
             ]
+            self._cycle_cache[cache_key] = copy.deepcopy(values)
             self.log(f"Downloaded daily data for day: {day_str}, generation: {generation}")
             return values
+        self._cycle_cache[cache_key] = None
         self.log(f"Failed to download daily data for day: {day_str}, generation: {generation}")
         return None
 

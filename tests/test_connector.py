@@ -143,3 +143,93 @@ async def test_async_clear_cache(mocker):
 
     assert connector._cache.get_value(datetime.date(2026, 10, 24), generation=False) is None
     mock_save.assert_awaited_once()
+
+
+async def test_incomplete_day_downloaded_only_once_per_cycle(mocker):
+    import copy
+
+    connector = TauronAmiplusConnector("user", "pass", "12345")
+    today = datetime.date(2026, 10, 25)
+
+    partial_day_response = {
+        "success": True,
+        "data": {
+            "values": [0.338, 0.087] + [None] * 22,
+            "zones": {"1": 0.425},
+            "sum": 0.425,
+            "chartZones": {"1": [False] * 24},
+            "zonesName": {"1": "Cała doba (T1)"},
+            "tariff": "G11",
+            "allData": [
+                {"EC": "0.338", "Date": "2026-10-25T02:00:00.000+02:00", "Hour": "1", "Status": "0", "Zone": "1"},
+                {"EC": "0.087", "Date": "2026-10-25T02:00:00.000+02:00", "Hour": "2", "Status": "0", "Zone": "1"},
+            ] + [
+                {"EC": None, "Date": "2026-10-25T02:00:00.000+02:00", "Hour": str(h), "Status": None, "Zone": "1"}
+                for h in range(3, 25)
+            ],
+        },
+    }
+
+    mock_chart_values = mocker.patch.object(
+        connector,
+        "get_chart_values",
+        side_effect=lambda payload: copy.deepcopy(partial_day_response),
+    )
+
+    # First call (e.g. from get_values_month_hourly)
+    res1 = await connector.get_raw_values_daily_for_day(today, generation=False)
+    # Second call (e.g. from get_values_year_hourly in the same update cycle)
+    res2 = await connector.get_raw_values_daily_for_day(today, generation=False)
+
+    assert res1 is not None
+    assert res2 is not None
+    # Under TDD: An incomplete day should not be re-downloaded repeatedly in the same cycle!
+    assert mock_chart_values.call_count == 1
+    assert connector._cycle_downloads == 1
+
+
+async def test_incomplete_day_is_retried_in_next_cycle(mocker):
+    import copy
+
+    connector = TauronAmiplusConnector("user", "pass", "12345")
+    today = datetime.date(2026, 10, 25)
+
+    partial_day_response = {
+        "success": True,
+        "data": {
+            "values": [0.338, 0.087] + [None] * 22,
+            "zones": {"1": 0.425},
+            "sum": 0.425,
+            "chartZones": {"1": [False] * 24},
+            "zonesName": {"1": "Cała doba (T1)"},
+            "tariff": "G11",
+            "allData": [
+                {"EC": "0.338", "Date": "2026-10-25T02:00:00.000+02:00", "Hour": "1", "Status": "0", "Zone": "1"},
+                {"EC": "0.087", "Date": "2026-10-25T02:00:00.000+02:00", "Hour": "2", "Status": "0", "Zone": "1"},
+            ] + [
+                {"EC": None, "Date": "2026-10-25T02:00:00.000+02:00", "Hour": str(h), "Status": None, "Zone": "1"}
+                for h in range(3, 25)
+            ],
+        },
+    }
+
+    mock_chart_values = mocker.patch.object(
+        connector,
+        "get_chart_values",
+        side_effect=lambda payload: copy.deepcopy(partial_day_response),
+    )
+
+    # First cycle
+    res1 = await connector.get_raw_values_daily_for_day(today, generation=False)
+    assert res1 is not None
+    assert mock_chart_values.call_count == 1
+    # Day is incomplete, so it shouldn't be locked into persistent cache
+    assert connector._cache.get_value(today, generation=False) is None
+
+    # Next cycle (cycle cache cleared on new cycle / restart / timer)
+    connector._cycle_cache.clear()
+    res2 = await connector.get_raw_values_daily_for_day(today, generation=False)
+    assert res2 is not None
+    assert mock_chart_values.call_count == 2
+
+
