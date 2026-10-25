@@ -1,6 +1,7 @@
 """Support for Tauron sensors."""
 import datetime
 import logging
+import time
 
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
@@ -70,6 +71,12 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: TauronAmiplusConf
     else:
         show_configurable = False
 
+    start_time = time.monotonic()
+    _LOGGER.info(
+        f"[{meter_id}] Initializing Tauron AMIplus (Meter: {meter_name}, Tariff: {tariff}, "
+        f"Options: balanced={show_balanced}, generation={show_generation_sensors}, statistics={store_statistics})"
+    )
+
     tauron_amiplus_update_coordinator = TauronAmiplusUpdateCoordinator(
         hass,
         config_entry.entry_id,
@@ -91,6 +98,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: TauronAmiplusConf
     config_entry.async_on_unload(config_entry.add_update_listener(async_reload_entry))
     register_all_services(hass)
     await tauron_amiplus_update_coordinator.async_request_refresh()
+    elapsed = time.monotonic() - start_time
+    _LOGGER.info(f"[{meter_id}] Integration setup completed in {elapsed:.2f}s")
     return True
 
 

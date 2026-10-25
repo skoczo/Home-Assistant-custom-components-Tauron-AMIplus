@@ -1,7 +1,9 @@
 """Update coordinator for TAURON sensors."""
 import datetime
+import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple, Any
 
@@ -130,8 +132,13 @@ class TauronAmiplusConnector:
         self._hass = hass
         self._storage_key = f"{STORAGE_KEY_PREFIX}_{config_entry_id}" if config_entry_id is not None else None
         self._cache = DailyDataCache(meter_id, hass, self._storage_key)
+        self._cycle_cache_hits = 0
+        self._cycle_downloads = 0
 
     async def get_raw_data(self) -> TauronAmiplusRawData:
+        start_fetch = time.monotonic()
+        self._cycle_cache_hits = 0
+        self._cycle_downloads = 0
         await self._cache.async_load()
         data = TauronAmiplusRawData()
         # data.payments = await self.get_moj_tauron()
@@ -144,6 +151,11 @@ class TauronAmiplusConnector:
             data.generation = TauronAmiplusDataSet()
         self._cache.delete_older_than(min(consumption_max_cache, generation_max_cache))
         await self._cache.async_save()
+        elapsed = time.monotonic() - start_fetch
+        _LOGGER.info(
+            f"[{self._meter_id}] Data fetch completed in {elapsed:.1f}s: "
+            f"{self._cycle_cache_hits} days loaded from cache, {self._cycle_downloads} new days downloaded from Tauron API"
+        )
         return data
 
     async def get_data_set(self, generation) -> Tuple[TauronAmiplusDataSet, datetime.datetime]:
@@ -176,8 +188,10 @@ class TauronAmiplusConnector:
     async def login_service(self, login_url: str, service: str) -> tuple[ClientSession, str]:
         success, response, session = await self.try_restore_session(service)
         if success:
+            _LOGGER.info(f"[{self._meter_id}] Reusing cached session cookies (valid)")
             return session, response
 
+        _LOGGER.info(f"[{self._meter_id}] Session expired or not found. Authenticating via Keycloak OIDC...")
         self.log(f"Logging in... ({service})")
 
         # Step 1: GET login page to retrieve the Keycloak form action URL.
@@ -227,6 +241,7 @@ class TauronAmiplusConnector:
             raise Exception("Failed to login")
 
         await self.store_session(session, service)
+        _LOGGER.info(f"[{self._meter_id}] Authenticated successfully via Keycloak OIDC")
         return session, login_response_text
 
     async def try_restore_session(self, service: str) -> (bool, str | None, ClientSession):
@@ -420,9 +435,11 @@ class TauronAmiplusConnector:
         day_str = TauronAmiplusConnector.format_date(day)
         cached_data = self._cache.get_value(day, generation)
         if cached_data is not None:
+            self._cycle_cache_hits += 1
             self.log(f"Cache hit for day {day_str}, generation: {generation}")
             return cached_data
 
+        self._cycle_downloads += 1
         payload = {
             "from": day_str,
             "to": day_str,
@@ -465,6 +482,14 @@ class TauronAmiplusConnector:
         post = await self.execute_post(CONST_URL_READINGS, payload)
         if post is not None:
             self.log(f"Downloaded readings for date: {date_to_str}, generation: {generation}")
+            if "data" in post and len(post["data"]) > 0:
+                reading = post["data"][-1]
+                c_val = reading.get("C")
+                r_date = reading.get("Date")
+                _LOGGER.info(
+                    f"[{self._meter_id}] Latest meter reading ({'generation' if generation else 'consumption'}): "
+                    f"{c_val} kWh (recorded at {r_date})"
+                )
         else:
             self.log(f"Failed to download readings for date: {date_to_str}, generation: {generation}")
         return post
@@ -582,6 +607,17 @@ class DailyDataCache:
         self._loaded = False
         self._dirty = False
 
+    @staticmethod
+    def _get_cache_stats(data: dict) -> tuple[int, str, str, float]:
+        cons = data.get("consumption", {})
+        gen = data.get("generation", {})
+        all_dates = sorted(set(cons.keys()) | set(gen.keys()))
+        count = len(all_dates)
+        min_date = all_dates[0] if all_dates else "none"
+        max_date = all_dates[-1] if all_dates else "none"
+        size_kb = len(json.dumps(data)) / 1024.0
+        return count, min_date, max_date, size_kb
+
     async def async_load(self) -> None:
         if self._loaded or self._store is None:
             return
@@ -589,8 +625,14 @@ class DailyDataCache:
         if stored:
             self._consumption_data = stored.get("consumption", {})
             self._generation_data = stored.get("generation", {})
-            self.log(
-                f"Loaded daily cache from storage: consumption={len(self._consumption_data)}, generation={len(self._generation_data)}"
+            count, min_date, max_date, size_kb = self._get_cache_stats(stored)
+            _LOGGER.info(
+                f"[{self._meter_id}] Cache loaded from .storage/{self._storage_key}_daily_cache: "
+                f"{count} days cached (range: {min_date} to {max_date}, size: {size_kb:.1f} KB)"
+            )
+        else:
+            _LOGGER.info(
+                f"[{self._meter_id}] No existing cache file found in .storage. A new persistent cache will be initialized."
             )
         self._loaded = True
 
@@ -603,7 +645,11 @@ class DailyDataCache:
         }
         await self._store.async_save(data)
         self._dirty = False
-        self.log("Saved daily cache to storage")
+        count, min_date, max_date, size_kb = self._get_cache_stats(data)
+        _LOGGER.info(
+            f"[{self._meter_id}] Cache saved to .storage: "
+            f"{count} total days cached (range: {min_date} to {max_date}, size: {size_kb:.1f} KB)"
+        )
 
     def __contains__(self, item: Tuple[str, bool]):
         date_str, generation = item

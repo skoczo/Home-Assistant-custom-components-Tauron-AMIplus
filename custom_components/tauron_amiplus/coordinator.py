@@ -1,6 +1,7 @@
 """Update coordinator for TAURON sensors."""
 import datetime
 import logging
+import time
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
@@ -52,14 +53,19 @@ class TauronAmiplusUpdateCoordinator(DataUpdateCoordinator[TauronAmiplusRawData]
         self.store_statistics = store_statistics
 
     async def update_method(self) -> TauronAmiplusRawData:
-        self.log("Starting data update")
+        start_time = time.monotonic()
+        _LOGGER.info(f"[{self.meter_id}] Starting data update from Tauron eLicznik")
         data = await self._update()
-        self.log("Downloaded all data")
         if data is not None and self.store_statistics:
             self.log("Starting statistics update")
             await self.generate_statistics(data)
             self.log("Updated all statistics")
         await self.connector.async_save_cache()
+        elapsed = time.monotonic() - start_time
+        _LOGGER.info(
+            f"[{self.meter_id}] Update cycle finished successfully in {elapsed:.1f}s. "
+            f"Next scheduled update in 8h 30m."
+        )
         return data
 
     async def generate_statistics(self, data):

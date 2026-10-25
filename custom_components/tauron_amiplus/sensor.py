@@ -98,8 +98,8 @@ async def async_setup_entry(hass, entry: TauronAmiplusConfigEntry, async_add_ent
                 meter_name
             )
         )
-
-    async_add_entities(sensors, True)
+    async_add_entities(sensors, False)
+    _LOGGER.info(f"[{meter_id}] Registered {len(sensors)} sensors")
 
 
 class TauronAmiplusSensor(SensorEntity, CoordinatorEntity):

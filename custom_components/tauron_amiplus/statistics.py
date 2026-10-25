@@ -80,15 +80,24 @@ class TauronAmiplusStatisticsUpdater:
                 if v["last_stats_time"] is not None and v["last_stats_time"] >= start_date_utc:
                     v["sum"] = 0.0
                     v["last_stats_time"] = None
+            _LOGGER.info(f"[{self.meter_id}] Manual statistics update requested from {fetch_from}")
         else:
             has_all_stats = all(v["last_stats_time"] is not None for v in all_stat_ids.values())
             if has_all_stats:
                 min_last_time = min(v["last_stats_time"] for v in all_stat_ids.values())
                 min_last_date = min_last_time.astimezone(warsaw_tz).date()
                 fetch_from = min_last_date - datetime.timedelta(days=1)
+                _LOGGER.info(
+                    f"[{self.meter_id}] Checking long-term statistics in Recorder: "
+                    f"last recorded timestamp is {min_last_time}"
+                )
             else:
                 # First run or missing stats: fetch default range (30 days back)
                 fetch_from = (now - datetime.timedelta(days=30)).date()
+                _LOGGER.info(
+                    f"[{self.meter_id}] Checking long-term statistics in Recorder: "
+                    f"initial sync for range {fetch_from} to {now.date()}"
+                )
 
         # Guard against excessively old query ranges
         max_history_date = (now - datetime.timedelta(days=365)).date()
@@ -100,7 +109,7 @@ class TauronAmiplusStatisticsUpdater:
 
         data_consumption = await self.connector.get_raw_values_daily_for_range(fetch_from, fetch_to, False)
         if data_consumption is None or not data_consumption.get("data", {}).get("allData"):
-            self.log(f"No consumption data received for range {fetch_from} - {fetch_to}")
+            _LOGGER.info(f"[{self.meter_id}] No new consumption data available from Tauron for range {fetch_from} to {fetch_to}")
             return
 
         raw_data = {CONST_CONSUMPTION: data_consumption["data"]["allData"]}
@@ -117,16 +126,28 @@ class TauronAmiplusStatisticsUpdater:
             raw_data[f"{CONST_BALANCED}_{CONST_CONSUMPTION}"] = balanced_consumption
             raw_data[f"{CONST_BALANCED}_{CONST_GENERATION}"] = balanced_generation
 
+        total_inserted = 0
         for s, v in all_stat_ids.items():
             if v["data_source"] not in raw_data:
                 continue
-            await self.update_stats(
+            count = await self.update_stats(
                 s,
                 v["name"],
                 v["sum"],
                 v["last_stats_time"],
                 v["zone"],
                 raw_data[v["data_source"]],
+            )
+            total_inserted += count
+
+        if total_inserted > 0:
+            _LOGGER.info(
+                f"[{self.meter_id}] Successfully imported statistics into Energy Dashboard "
+                f"for range {fetch_from} to {fetch_to} ({total_inserted} records across {len(all_stat_ids)} series)"
+            )
+        else:
+            _LOGGER.info(
+                f"[{self.meter_id}] Statistics are already up to date. Tauron has not published new hourly data yet."
             )
 
     async def prepare_stats_ids(self, zones):
@@ -295,8 +316,10 @@ class TauronAmiplusStatisticsUpdater:
         if statistic_data:
             async_add_external_statistics(self.hass, metadata, statistic_data)
             self.log(f"Added {len(statistic_data)} new entries for statistic: {statistic_id}")
+            return len(statistic_data)
         else:
             self.log(f"No new entries to update for statistic: {statistic_id}")
+            return 0
 
     async def get_last_stats_date(self, statistic_id):
         last_stats = await self.get_last_stats(statistic_id)
