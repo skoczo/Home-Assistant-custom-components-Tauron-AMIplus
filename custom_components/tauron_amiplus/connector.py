@@ -321,6 +321,13 @@ class TauronAmiplusConnector:
         self.clear_cache()
         await self._cache.async_save()
 
+    def is_day_cached(self, day: datetime.date | datetime.datetime) -> bool:
+        has_consumption = self._cache.get_value(day, generation=False) is not None
+        if self._show_generation or self._show_balanced:
+            has_generation = self._cache.get_value(day, generation=True) is not None
+            return has_consumption and has_generation
+        return has_consumption
+
     @staticmethod
     def _get_meters(text: str) -> list:
         regex = r".*data-data='{\"type\": \".*\"}'>.*"

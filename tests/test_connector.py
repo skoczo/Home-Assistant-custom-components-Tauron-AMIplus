@@ -233,3 +233,19 @@ async def test_incomplete_day_is_retried_in_next_cycle(mocker):
     assert mock_chart_values.call_count == 2
 
 
+def test_is_day_cached():
+    connector = TauronAmiplusConnector("user", "pass", "12345", show_generation=True)
+    day = datetime.date(2026, 10, 24)
+
+    assert not connector.is_day_cached(day)
+
+    # Only consumption added
+    connector._cache.add_value(day, generation=False, value={"EC": 1})
+    assert not connector.is_day_cached(day)
+
+    # Both consumption and generation added
+    connector._cache.add_value(day, generation=True, value={"EC": 1})
+    assert connector.is_day_cached(day)
+
+
+

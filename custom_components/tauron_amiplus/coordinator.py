@@ -5,9 +5,15 @@ import time
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util.dt import get_time_zone
 
 from .connector import TauronAmiplusConnector, TauronAmiplusRawData
-from .const import (DEFAULT_UPDATE_INTERVAL, DOMAIN)
+from .const import (
+    DOMAIN,
+    SMART_POLLING_WINDOW_MORNING,
+    SMART_POLLING_WINDOW_AFTERNOON,
+    SMART_POLLING_WINDOW_RETRY,
+)
 from .statistics import TauronAmiplusStatisticsUpdater
 
 _LOGGER = logging.getLogger(__name__)
@@ -32,11 +38,12 @@ class TauronAmiplusUpdateCoordinator(DataUpdateCoordinator[TauronAmiplusRawData]
             store_statistics: bool = False,
             config_entry=None,
     ):
+        initial_interval, _ = self.get_next_smart_poll_window()
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=DEFAULT_UPDATE_INTERVAL,
+            update_interval=initial_interval,
             update_method=self.update_method,
             config_entry=config_entry,
         )
@@ -52,6 +59,39 @@ class TauronAmiplusUpdateCoordinator(DataUpdateCoordinator[TauronAmiplusRawData]
         self.show_configurable_date = show_configurable_date
         self.store_statistics = store_statistics
 
+    @staticmethod
+    def get_next_smart_poll_window(
+        now: datetime.datetime | None = None,
+        yesterday_complete: bool = True,
+    ) -> tuple[datetime.timedelta, datetime.datetime]:
+        tz = get_time_zone("Europe/Warsaw")
+        if now is None:
+            now = datetime.datetime.now(tz)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=tz)
+
+        today = now.date()
+        windows = [SMART_POLLING_WINDOW_MORNING, SMART_POLLING_WINDOW_AFTERNOON]
+        if not yesterday_complete:
+            windows.append(SMART_POLLING_WINDOW_RETRY)
+
+        candidates: list[datetime.datetime] = []
+        for h, m in windows:
+            candidate = datetime.datetime.combine(today, datetime.time(h, m), tzinfo=tz)
+            if (candidate - now).total_seconds() > 120:
+                candidates.append(candidate)
+
+        if not candidates:
+            tomorrow = today + datetime.timedelta(days=1)
+            h, m = SMART_POLLING_WINDOW_MORNING
+            candidates.append(datetime.datetime.combine(tomorrow, datetime.time(h, m), tzinfo=tz))
+
+        next_run = min(candidates)
+        delta = next_run - now
+        if delta.total_seconds() < 60:
+            delta = datetime.timedelta(minutes=1)
+        return delta, next_run
+
     async def update_method(self) -> TauronAmiplusRawData:
         start_time = time.monotonic()
         _LOGGER.info(f"[{self.meter_id}] Starting data update from Tauron eLicznik")
@@ -62,9 +102,19 @@ class TauronAmiplusUpdateCoordinator(DataUpdateCoordinator[TauronAmiplusRawData]
             self.log("Updated all statistics")
         await self.connector.async_save_cache()
         elapsed = time.monotonic() - start_time
+
+        warsaw_tz = get_time_zone("Europe/Warsaw")
+        yesterday = (datetime.datetime.now(warsaw_tz) - datetime.timedelta(days=1)).date()
+        yesterday_ok = bool(self.connector.is_day_cached(yesterday))
+        next_interval, next_time = self.get_next_smart_poll_window(yesterday_complete=yesterday_ok)
+        self.update_interval = next_interval
+        hours, remainder = divmod(int(next_interval.total_seconds()), 3600)
+        minutes, _ = divmod(remainder, 60)
+
         _LOGGER.info(
             f"[{self.meter_id}] Update cycle finished successfully in {elapsed:.1f}s. "
-            f"Next scheduled update in 8h 30m."
+            f"Next scheduled update at {next_time.strftime('%H:%M')} (in {hours}h {minutes}m"
+            f"{', 22:30 retry skipped: yesterday complete' if yesterday_ok else ', including 22:30 retry: yesterday missing'})."
         )
         return data
 

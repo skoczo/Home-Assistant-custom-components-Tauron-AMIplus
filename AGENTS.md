@@ -45,8 +45,8 @@ custom_components/tauron_amiplus/
 
 2. **Strict Rate Limiting & Anti-Ban Safeguards**:
    - TAURON enforces aggressive rate-limiting ("*Przekroczono maksymalną liczbę logowań*").
-   - **CRITICAL**: The update interval is set to **8.5 hours** (`DEFAULT_UPDATE_INTERVAL = timedelta(hours=8, minutes=30)`).
-   - **NEVER** decrease this interval without user consent or add frequent background polling. Daily readings in Tauron eLicznik only update once or twice a day anyway (usually with 1-2 days delay).
+   - **CRITICAL**: The component uses **Smart Polling** (target windows at **06:30** and **14:30**, with a conditional retry at **22:30** only if yesterday's full data is missing from cache).
+   - **NEVER** add frequent background polling or decrease intervals without user consent. Daily readings in Tauron eLicznik only update once or twice a day anyway (usually with 1-2 days delay).
 
 3. **API Endpoints**:
    - `CONST_URL_SELECT_METER` (`/ustaw_punkt`): Sets the active meter on the session via `site[client]`.
