@@ -2,6 +2,7 @@
 
 [![GitHub Latest Release](https://img.shields.io/github/v/release/skoczo/Home-Assistant-custom-components-Tauron-AMIplus)](https://github.com/skoczo/Home-Assistant-custom-components-Tauron-AMIplus/releases)
 [![Test](https://github.com/skoczo/Home-Assistant-custom-components-Tauron-AMIplus/actions/workflows/test.yaml/badge.svg)](https://github.com/skoczo/Home-Assistant-custom-components-Tauron-AMIplus/actions/workflows/test.yaml)
+[![codecov](https://codecov.io/gh/skoczo/Home-Assistant-custom-components-Tauron-AMIplus/graph/badge.svg)](https://codecov.io/gh/skoczo/Home-Assistant-custom-components-Tauron-AMIplus)
 [![Validate HACS](https://github.com/skoczo/Home-Assistant-custom-components-Tauron-AMIplus/actions/workflows/hacs.yaml/badge.svg)](https://github.com/skoczo/Home-Assistant-custom-components-Tauron-AMIplus/actions/workflows/hacs.yaml)
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://hacs.xyz/)
 

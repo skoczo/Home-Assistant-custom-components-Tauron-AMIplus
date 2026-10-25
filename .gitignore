@@ -12,6 +12,7 @@ dist/
 # Unit test / coverage
 .pytest_cache/
 .coverage
+coverage.xml
 htmlcov/
 
 # Linters & formatters
