@@ -29,11 +29,34 @@ def test_get_time():
     # 2026-10-24 00:00 CEST -> 2026-10-23 22:00 UTC
     assert t1 == datetime.datetime(2026, 10, 23, 22, 0, tzinfo=datetime.timezone.utc)
 
-    # 25th hour (DST change)
+    # 25th hour (DST change, 23:00 CET -> 22:00 UTC)
     hour_25 = {"Date": "2026-10-25", "Hour": 25}
     t25 = TauronAmiplusStatisticsUpdater.get_time(hour_25)
     assert t25.tzinfo is not None
-    assert t25 == datetime.datetime(2026, 10, 25, 23, 0, tzinfo=datetime.timezone.utc)
+    assert t25 == datetime.datetime(2026, 10, 25, 22, 0, tzinfo=datetime.timezone.utc)
+
+    # Transition hours on Autumn DST day:
+    # Hour 3: 02:00 CEST -> 2026-10-25 00:00 UTC
+    hour_3 = {"Date": "2026-10-25", "Hour": 3}
+    assert TauronAmiplusStatisticsUpdater.get_time(hour_3) == datetime.datetime(
+        2026, 10, 25, 0, 0, tzinfo=datetime.timezone.utc
+    )
+
+    # Hour 4: 02:00 CET (repeat hour) -> 2026-10-25 01:00 UTC
+    hour_4 = {"Date": "2026-10-25", "Hour": 4}
+    assert TauronAmiplusStatisticsUpdater.get_time(hour_4) == datetime.datetime(
+        2026, 10, 25, 1, 0, tzinfo=datetime.timezone.utc
+    )
+
+    # Spring DST change day: 2026-03-29 (23-hour day)
+    hour_spr_1 = {"Date": "2026-03-29", "Hour": 1}
+    assert TauronAmiplusStatisticsUpdater.get_time(hour_spr_1) == datetime.datetime(
+        2026, 3, 28, 23, 0, tzinfo=datetime.timezone.utc
+    )
+    hour_spr_23 = {"Date": "2026-03-29", "Hour": 23}
+    assert TauronAmiplusStatisticsUpdater.get_time(hour_spr_23) == datetime.datetime(
+        2026, 3, 29, 21, 0, tzinfo=datetime.timezone.utc
+    )
 
 
 def test_prepare_balanced_raw_data():
@@ -421,3 +444,154 @@ async def test_manually_update_entry(mocker):
     mock_connector.get_raw_data.assert_awaited_once()
     mock_update_all.assert_awaited_once()
     mock_connector.async_save_cache.assert_awaited_once()
+
+
+async def test_statistics_self_healing_dst_day(mocker):
+    mock_hass = MagicMock()
+    mock_connector = AsyncMock()
+    mock_connector._cache = MagicMock()
+    mock_add_stats = mocker.patch(
+        "custom_components.tauron_amiplus.statistics.async_add_external_statistics"
+    )
+
+    updater = TauronAmiplusStatisticsUpdater(
+        mock_hass, mock_connector, "123456", "Dom", show_generation=False, show_balanced=False
+    )
+
+    # Last recorded stat is at 2026-10-25 22:00 UTC (hour 25)
+    last_time = datetime.datetime(2026, 10, 25, 22, 0, tzinfo=datetime.timezone.utc)
+    mocker.patch.object(
+        updater,
+        "get_last_stats",
+        return_value={
+            "tauron_importer:123456_consumption": [
+                {
+                    "start": last_time.timestamp(),
+                    "sum": 112.885,
+                    "end": (last_time + datetime.timedelta(hours=1)).timestamp(),
+                }
+            ]
+        },
+    )
+
+    # In Recorder, only 24 hours exist for 2026-10-25 (missing the 01:00 UTC gap)
+    mocker.patch.object(updater, "get_stats_count_in_range", return_value=24)
+
+    # Baseline before 2026-10-25 (end of 2026-10-24)
+    baseline_time = datetime.datetime(2026, 10, 24, 21, 0, tzinfo=datetime.timezone.utc)
+    mocker.patch.object(
+        updater,
+        "get_stat_before",
+        return_value=(100.0, baseline_time),
+    )
+
+    # Tauron returns all 25 finalized hours for 2026-10-25 (with finalized hour 2 = 0.394 and hour 3 & 4 = 0.340)
+    full_25_hours = [
+        {"Date": "2026-10-25", "Hour": 1, "EC": "0.338", "Zone": "1"},
+        {"Date": "2026-10-25", "Hour": 2, "EC": "0.394", "Zone": "1"},
+        {"Date": "2026-10-25", "Hour": 3, "EC": "0.340", "Zone": "1"},
+        {"Date": "2026-10-25", "Hour": 4, "EC": "0.340", "Zone": "1"},
+    ] + [
+        {"Date": "2026-10-25", "Hour": h, "EC": "0.500", "Zone": "1"}
+        for h in range(5, 26)
+    ]
+    mock_connector.get_raw_values_daily_for_range.return_value = {
+        "data": {"allData": full_25_hours}
+    }
+
+    raw_data = TauronAmiplusRawData()
+    raw_data.consumption = TauronAmiplusDataSet()
+    raw_data.consumption.json_daily = {"data": {"zonesName": {"1": "G11"}}}
+
+    await updater.update_all(raw_data)
+
+    # Should detect incomplete count (24 < 25), delete cache for 2026-10-25, and rewrite all 25 hours
+    mock_connector._cache.delete_day.assert_called_with(datetime.date(2026, 10, 25))
+    mock_add_stats.assert_called_once()
+    stats_data = mock_add_stats.call_args[0][2]
+    assert len(stats_data) == 25
+    # Hour 1
+    assert stats_data[0]["start"] == datetime.datetime(2026, 10, 24, 22, 0, tzinfo=datetime.timezone.utc)
+    assert stats_data[0]["state"] == 0.338
+    assert round(stats_data[0]["sum"], 3) == 100.338
+    # Hour 2 (overwritten with 0.394 instead of provisional 0.087!)
+    assert stats_data[1]["start"] == datetime.datetime(2026, 10, 24, 23, 0, tzinfo=datetime.timezone.utc)
+    assert stats_data[1]["state"] == 0.394
+    assert round(stats_data[1]["sum"], 3) == 100.732
+    # Hour 3 (02:00 CEST)
+    assert stats_data[2]["start"] == datetime.datetime(2026, 10, 25, 0, 0, tzinfo=datetime.timezone.utc)
+    assert stats_data[2]["state"] == 0.340
+    # Hour 4 (02:00 CET - the previously missing gap!)
+    assert stats_data[3]["start"] == datetime.datetime(2026, 10, 25, 1, 0, tzinfo=datetime.timezone.utc)
+    assert stats_data[3]["state"] == 0.340
+    # Hour 25
+    assert stats_data[24]["start"] == datetime.datetime(2026, 10, 25, 22, 0, tzinfo=datetime.timezone.utc)
+
+
+def test_dst_autumn_continuity_3_days():
+    # 2026-10-24 (24h), 2026-10-25 (25h), 2026-10-26 (24h) = 73 continuous UTC hours
+    hours = []
+    for h in range(1, 25):
+        hours.append({"Date": "2026-10-24", "Hour": h})
+    for h in range(1, 26):
+        hours.append({"Date": "2026-10-25", "Hour": h})
+    for h in range(1, 25):
+        hours.append({"Date": "2026-10-26", "Hour": h})
+
+    assert len(hours) == 73
+    timestamps = [TauronAmiplusStatisticsUpdater.get_time(h) for h in hours]
+
+    # Verify every step is exactly +1 hour in UTC
+    for i in range(len(timestamps) - 1):
+        diff = timestamps[i + 1] - timestamps[i]
+        assert diff == datetime.timedelta(hours=1), f"Discontinuity at index {i}: {timestamps[i]} -> {timestamps[i+1]}"
+
+    # No duplicates
+    assert len(set(timestamps)) == 73
+    # Start: 2026-10-23 22:00 UTC (2026-10-24 00:00 CEST)
+    assert timestamps[0] == datetime.datetime(2026, 10, 23, 22, 0, tzinfo=datetime.timezone.utc)
+    # End: 2026-10-26 22:00 UTC (2026-10-26 23:00 CET)
+    assert timestamps[-1] == datetime.datetime(2026, 10, 26, 22, 0, tzinfo=datetime.timezone.utc)
+
+
+def test_dst_spring_continuity_3_days():
+    # 2026-03-28 (24h), 2026-03-29 (23h), 2026-03-30 (24h) = 71 continuous UTC hours
+    hours = []
+    for h in range(1, 25):
+        hours.append({"Date": "2026-03-28", "Hour": h})
+    for h in range(1, 24):
+        hours.append({"Date": "2026-03-29", "Hour": h})
+    for h in range(1, 25):
+        hours.append({"Date": "2026-03-30", "Hour": h})
+
+    assert len(hours) == 71
+    timestamps = [TauronAmiplusStatisticsUpdater.get_time(h) for h in hours]
+
+    for i in range(len(timestamps) - 1):
+        diff = timestamps[i + 1] - timestamps[i]
+        assert diff == datetime.timedelta(hours=1), f"Discontinuity at index {i}: {timestamps[i]} -> {timestamps[i+1]}"
+
+    assert len(set(timestamps)) == 71
+    # Start: 2026-03-27 23:00 UTC (2026-03-28 00:00 CET)
+    assert timestamps[0] == datetime.datetime(2026, 3, 27, 23, 0, tzinfo=datetime.timezone.utc)
+    # End: 2026-03-30 21:00 UTC (2026-03-30 23:00 CEST)
+    assert timestamps[-1] == datetime.datetime(2026, 3, 30, 21, 0, tzinfo=datetime.timezone.utc)
+
+
+def test_dst_autumn_balanced_25_hours():
+    raw_data = {
+        CONST_CONSUMPTION: [
+            {"Date": "2026-10-25", "Hour": h, "EC": "2.0", "Zone": "1"}
+            for h in range(1, 26)
+        ],
+        CONST_GENERATION: [
+            {"Date": "2026-10-25", "Hour": h, "EC": "1.0", "Zone": "1"}
+            for h in range(1, 26)
+        ],
+    }
+    b_cons, b_gen = TauronAmiplusStatisticsUpdater.prepare_balanced_raw_data(raw_data)
+    assert len(b_cons) == 25
+    assert len(b_gen) == 25
+    for c, g in zip(b_cons, b_gen):
+        assert c["EC"] == "1.0"
+        assert g["EC"] == "0"

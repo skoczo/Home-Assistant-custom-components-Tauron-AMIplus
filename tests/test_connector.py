@@ -248,4 +248,133 @@ def test_is_day_cached():
     assert connector.is_day_cached(day)
 
 
+def test_dst_autumn_expansion():
+    # Autumn DST day (2026-10-25): 25 hours expected
+    date = datetime.date(2026, 10, 25)
+    data = {
+        "data": {
+            "values": ["0.338", "0.394", "0.680", "0.328"] + ["0.500"] * 20,
+            "chartZones": {"1": [True] * 24},
+            "zonesName": {"1": "G11"},
+        }
+    }
+    TauronAmiplusConnector.add_all_data(data, date)
+    all_data = data["data"]["allData"]
+    assert len(all_data) == 25
+    # Hour 1 and Hour 2 unchanged
+    assert all_data[0]["Hour"] == 1 and all_data[0]["EC"] == "0.338"
+    assert all_data[1]["Hour"] == 2 and all_data[1]["EC"] == "0.394"
+    # Hour 3 and Hour 4 split 0.680 equally into two 0.340 entries
+    assert all_data[2]["Hour"] == 3 and all_data[2]["EC"] == "0.34"
+    assert all_data[3]["Hour"] == 4 and all_data[3]["EC"] == "0.34"
+    assert all_data[4]["Hour"] == 5 and all_data[4]["EC"] == "0.328"
+    assert all_data[24]["Hour"] == 25
+    # Total sum is preserved
+    orig_sum = sum(float(x) for x in data["data"]["values"])
+    new_sum = sum(float(x["EC"]) for x in all_data)
+    assert round(orig_sum, 3) == round(new_sum, 3)
+
+
+def test_dst_spring_compression():
+    # Spring DST day (2026-03-29): 23 hours expected
+    date = datetime.date(2026, 3, 29)
+    data = {
+        "data": {
+            "values": ["0.300", "0.400", "0.000", "0.500"] + ["0.200"] * 20,
+            "chartZones": {"1": [True] * 24},
+            "zonesName": {"1": "G11"},
+        }
+    }
+    TauronAmiplusConnector.add_all_data(data, date)
+    all_data = data["data"]["allData"]
+    assert len(all_data) == 23
+    assert all_data[0]["Hour"] == 1 and all_data[0]["EC"] == "0.300"
+    assert all_data[1]["Hour"] == 2 and all_data[1]["EC"] == "0.400"
+    assert all_data[2]["Hour"] == 3 and all_data[2]["EC"] == "0.500"
+    assert all_data[22]["Hour"] == 23
+
+
+async def test_get_raw_values_daily_for_range_only_complete_days(mocker):
+    connector = TauronAmiplusConnector("user", "pass", "12345")
+    day1 = datetime.date(2026, 10, 23)
+    day2 = datetime.date(2026, 10, 24)
+
+    # day1 is incomplete (only 2 hours)
+    day1_incomplete = {
+        "data": {
+            "allData": [
+                {"Date": "2026-10-23", "Hour": 1, "EC": "1.0", "Zone": "1", "Status": "0"},
+                {"Date": "2026-10-23", "Hour": 2, "EC": "1.0", "Zone": "1", "Status": "0"},
+            ],
+            "sum": 2.0,
+            "zones": {"1": 2.0},
+            "zonesName": {"1": "G11"},
+        }
+    }
+    # day2 is complete (24 hours)
+    day2_complete = {
+        "data": {
+            "allData": [
+                {"Date": "2026-10-24", "Hour": h, "EC": "1.0", "Zone": "1", "Status": "0"}
+                for h in range(1, 25)
+            ],
+            "sum": 24.0,
+            "zones": {"1": 24.0},
+            "zonesName": {"1": "G11"},
+        }
+    }
+
+    mocker.patch.object(
+        connector,
+        "get_raw_values_daily_for_day",
+        side_effect=[day1_incomplete, day2_complete],
+    )
+
+    data = await connector.get_raw_values_daily_for_range(day1, day2, generation=False, only_complete_days=True)
+    assert data is not None
+    # day1 should be filtered out, only day2 (24 hours) included
+    assert len(data["data"]["allData"]) == 24
+    assert data["data"]["sum"] == 24.0
+
+
+def test_dst_autumn_already_25_values():
+    # If API or meter CSV already provides 25 values on an autumn DST day, don't split further
+    date = datetime.date(2026, 10, 25)
+    data = {
+        "data": {
+            "values": ["0.338"] * 25,
+            "chartZones": {"1": [True] * 25},
+            "zonesName": {"1": "G11"},
+        }
+    }
+    TauronAmiplusConnector.add_all_data(data, date)
+    assert len(data["data"]["allData"]) == 25
+    assert data["data"]["allData"][0]["Hour"] == 1
+    assert data["data"]["allData"][24]["Hour"] == 25
+
+
+def test_dst_autumn_multizone_preservation():
+    # Multi-zone tariff (G12): zone flags duplicated for both split hours
+    date = datetime.date(2026, 10, 25)
+    chart_zones_1 = [True] * 2 + [False] + [True] * 21  # Hour 3 is not zone 1
+    chart_zones_2 = [False] * 2 + [True] + [False] * 21  # Hour 3 is zone 2 (off-peak)
+    data = {
+        "data": {
+            "values": ["0.100"] * 24,
+            "chartZones": {"1": chart_zones_1, "2": chart_zones_2},
+            "zonesName": {"1": "Szczyt", "2": "Dolina"},
+        }
+    }
+    TauronAmiplusConnector.add_all_data(data, date)
+    all_data = data["data"]["allData"]
+    assert len(all_data) == 25
+    # Both Hour 3 and Hour 4 must have Zone "2"
+    assert all_data[2]["Hour"] == 3 and all_data[2]["Zone"] == "2"
+    assert all_data[3]["Hour"] == 4 and all_data[3]["Zone"] == "2"
+    # Hour 1 and Hour 5 are Zone "1"
+    assert all_data[0]["Zone"] == "1"
+    assert all_data[4]["Zone"] == "1"
+
+
+
 

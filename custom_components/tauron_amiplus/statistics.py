@@ -72,14 +72,13 @@ class TauronAmiplusStatisticsUpdater:
 
         warsaw_tz = get_time_zone("Europe/Warsaw")
         now = datetime.datetime.now(warsaw_tz)
+        yesterday = (now - datetime.timedelta(days=1)).date()
 
+        re_sync_from_time = None
         if start_date is not None:
             fetch_from = start_date.astimezone(warsaw_tz).date()
             start_date_utc = as_utc(start_date)
-            for s, v in all_stat_ids.items():
-                if v["last_stats_time"] is not None and v["last_stats_time"] >= start_date_utc:
-                    v["sum"] = 0.0
-                    v["last_stats_time"] = None
+            re_sync_from_time = start_date_utc
             _LOGGER.info(f"[{self.meter_id}] Manual statistics update requested from {fetch_from}")
         else:
             has_all_stats = all(v["last_stats_time"] is not None for v in all_stat_ids.values())
@@ -91,12 +90,25 @@ class TauronAmiplusStatisticsUpdater:
                     f"[{self.meter_id}] Checking long-term statistics in Recorder: "
                     f"last recorded timestamp is {min_last_time}"
                 )
+                expected_hours = TauronAmiplusConnector.get_expected_hours_for_day(min_last_date)
+                day_start_utc = as_utc(datetime.datetime.combine(min_last_date, datetime.time(0, 0), tzinfo=warsaw_tz))
+                day_end_utc = day_start_utc + datetime.timedelta(hours=expected_hours)
+                primary_stat_id = self.get_stats_id(CONST_CONSUMPTION)
+                count = await self.get_stats_count_in_range(primary_stat_id, day_start_utc, day_end_utc)
+                if 0 < count < expected_hours:
+                    _LOGGER.info(
+                        f"[{self.meter_id}] Last recorded date {min_last_date} is incomplete in Recorder "
+                        f"({count}/{expected_hours} hours). Re-syncing from {min_last_date} to heal missing data."
+                    )
+                    re_sync_from_time = day_start_utc
+                    if hasattr(self.connector, "_cache") and self.connector._cache is not None:
+                        self.connector._cache.delete_day(min_last_date)
             else:
                 # First run or missing stats: fetch default range (30 days back)
                 fetch_from = (now - datetime.timedelta(days=30)).date()
                 _LOGGER.info(
                     f"[{self.meter_id}] Checking long-term statistics in Recorder: "
-                    f"initial sync for range {fetch_from} to {now.date()}"
+                    f"initial sync for range {fetch_from} to {yesterday}"
                 )
 
         # Guard against excessively old query ranges
@@ -104,10 +116,16 @@ class TauronAmiplusStatisticsUpdater:
         if fetch_from < max_history_date:
             fetch_from = max_history_date
 
-        fetch_to = now.date()
+        fetch_to = yesterday
+        if fetch_from > fetch_to:
+            _LOGGER.info(f"[{self.meter_id}] Statistics are already up to date up to yesterday ({fetch_to}).")
+            return
+
         self.log(f"Fetching raw daily energy data for range: {fetch_from} to {fetch_to}")
 
-        data_consumption = await self.connector.get_raw_values_daily_for_range(fetch_from, fetch_to, False)
+        data_consumption = await self.connector.get_raw_values_daily_for_range(
+            fetch_from, fetch_to, False, only_complete_days=True
+        )
         if data_consumption is None or not data_consumption.get("data", {}).get("allData"):
             _LOGGER.info(f"[{self.meter_id}] No new consumption data available from Tauron for range {fetch_from} to {fetch_to}")
             return
@@ -115,7 +133,9 @@ class TauronAmiplusStatisticsUpdater:
         raw_data = {CONST_CONSUMPTION: data_consumption["data"]["allData"]}
 
         if self.show_generation or self.show_balanced:
-            data_generation = await self.connector.get_raw_values_daily_for_range(fetch_from, fetch_to, True)
+            data_generation = await self.connector.get_raw_values_daily_for_range(
+                fetch_from, fetch_to, True, only_complete_days=True
+            )
             if data_generation is not None and data_generation.get("data", {}).get("allData"):
                 raw_data[CONST_GENERATION] = data_generation["data"]["allData"]
             else:
@@ -130,11 +150,19 @@ class TauronAmiplusStatisticsUpdater:
         for s, v in all_stat_ids.items():
             if v["data_source"] not in raw_data:
                 continue
+            if re_sync_from_time is not None:
+                initial_sum, last_stats_time = await self.get_stat_before(
+                    s, re_sync_from_time, v.get("last_stat_row")
+                )
+            else:
+                initial_sum = v["sum"]
+                last_stats_time = v["last_stats_time"]
+
             count = await self.update_stats(
                 s,
                 v["name"],
-                v["sum"],
-                v["last_stats_time"],
+                initial_sum,
+                last_stats_time,
                 v["zone"],
                 raw_data[v["data_source"]],
             )
@@ -204,6 +232,7 @@ class TauronAmiplusStatisticsUpdater:
             last_stat = await self.get_last_stats(k)
             if k in last_stat and len(last_stat[k]) > 0:
                 row = last_stat[k][0]
+                v["last_stat_row"] = row
                 v["sum"] = float(row.get("sum", 0.0) or 0.0)
                 start = row.get("start")
                 if isinstance(start, (int, float)):
@@ -342,6 +371,72 @@ class TauronAmiplusStatisticsUpdater:
             statistics_during_period,
             self.hass, self.get_time(raw_data[0]), None, [statistic_id], "hour", None, {"state", "sum"})
 
+    async def get_stat_before(
+        self, statistic_id: str, before_time: datetime.datetime, last_stat_row: dict | None
+    ) -> tuple[float, datetime.datetime | None]:
+        if last_stat_row is not None:
+            last_start = self._get_row_start(last_stat_row)
+            if last_start is not None and last_start < before_time:
+                last_sum = float(last_stat_row.get("sum", 0.0) or 0.0)
+                return last_sum, last_start
+
+        start_search = before_time - datetime.timedelta(days=30)
+        try:
+            stats = await get_instance(self.hass).async_add_executor_job(
+                statistics_during_period,
+                self.hass,
+                start_search,
+                before_time,
+                {statistic_id},
+                "hour",
+                None,
+                {"sum", "state"},
+            )
+            if stats and statistic_id in stats and len(stats[statistic_id]) > 0:
+                rows = [r for r in stats[statistic_id] if self._get_row_start(r) < before_time]
+                if rows:
+                    last_row = rows[-1]
+                    row_sum = float(last_row.get("sum", 0.0) or 0.0)
+                    row_start = self._get_row_start(last_row)
+                    return row_sum, row_start
+        except Exception as e:
+            _LOGGER.warning(f"Failed to query statistics before {before_time} for {statistic_id}: {e}")
+
+        return 0.0, None
+
+    async def get_stats_count_in_range(
+        self, statistic_id: str, start_time: datetime.datetime, end_time: datetime.datetime
+    ) -> int:
+        try:
+            stats = await get_instance(self.hass).async_add_executor_job(
+                statistics_during_period,
+                self.hass,
+                start_time,
+                end_time,
+                {statistic_id},
+                "hour",
+                None,
+                {"state"},
+            )
+            if stats and statistic_id in stats:
+                rows = [
+                    r for r in stats[statistic_id]
+                    if start_time <= self._get_row_start(r) < end_time
+                ]
+                return len(rows)
+        except Exception as e:
+            _LOGGER.debug(f"Failed to query stats count in range: {e}")
+        return 0
+
+    @staticmethod
+    def _get_row_start(row: dict) -> datetime.datetime | None:
+        start = row.get("start")
+        if isinstance(start, (int, float)):
+            return utc_from_timestamp(start)
+        if isinstance(start, datetime.datetime) and start.tzinfo is None:
+            return as_utc(start)
+        return start
+
     def log(self, msg):
         _LOGGER.debug(f"[{self.meter_id}]: {msg}")
 
@@ -350,8 +445,7 @@ class TauronAmiplusStatisticsUpdater:
         zone = get_time_zone("Europe/Warsaw")
         date_str = raw_hour["Date"]
         hour = int(raw_hour["Hour"]) - 1
-        if hour < 24:
-            dt = datetime.datetime.strptime(f"{date_str} {hour:02d}:00", "%Y-%m-%d %H:%M").replace(tzinfo=zone)
-        else:
-            dt = datetime.datetime.strptime(f"{date_str} 23:00", "%Y-%m-%d %H:%M").replace(tzinfo=zone) + datetime.timedelta(hours=1)
-        return as_utc(dt)
+        day_date = datetime.date.fromisoformat(date_str)
+        day_start_local = datetime.datetime.combine(day_date, datetime.time(0, 0), tzinfo=zone)
+        day_start_utc = as_utc(day_start_local)
+        return day_start_utc + datetime.timedelta(hours=hour)

@@ -15,6 +15,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.storage import Store
 from homeassistant.util import slugify
+from homeassistant.util.dt import as_utc, get_time_zone
 
 from .const import (
     CONST_DATE_FORMAT,
@@ -417,7 +418,9 @@ class TauronAmiplusConnector:
         start_day = now.replace(year=now.year - 1)
         return await self.get_raw_values_daily_for_range(start_day, now, generation)
 
-    async def get_raw_values_daily_for_range(self, day_from: datetime.date, day_to: datetime.date, generation):
+    async def get_raw_values_daily_for_range(
+        self, day_from: datetime.date, day_to: datetime.date, generation: bool, only_complete_days: bool = False
+    ):
         data = {"data": {
             "allData": [],
             "sum": 0,
@@ -427,7 +430,14 @@ class TauronAmiplusConnector:
         for day in [day_from + datetime.timedelta(days=x) for x in range((day_to - day_from).days + 1)]:
             day_data = await self.get_raw_values_daily_for_day(day, generation)
             if day_data is not None:
-                data["data"]["allData"].extend(day_data["data"]["allData"])
+                day_all_data = day_data["data"].get("allData", [])
+                expected_hours = self.get_expected_hours_for_day(day)
+                if only_complete_days:
+                    if len(day_all_data) != expected_hours or not all(self.contains_data(a) for a in day_all_data):
+                        self.log(f"Skipping incomplete day {day} from range ({len(day_all_data)}/{expected_hours} hours)")
+                        continue
+
+                data["data"]["allData"].extend(day_all_data)
                 data["data"]["sum"] += day_data["data"]["sum"]
                 data["data"]["zonesName"] = {**(day_data["data"]["zonesName"]), **(data["data"]["zonesName"])}
                 if "tariff" in day_data["data"]:
@@ -444,8 +454,10 @@ class TauronAmiplusConnector:
 
     async def get_raw_values_daily_for_day(self, day, generation: bool):
         day_str = TauronAmiplusConnector.format_date(day)
+        expected_hours = self.get_expected_hours_for_day(day)
         cached_data = self._cache.get_value(day, generation)
         if cached_data is not None:
+            self.normalize_daily_data(cached_data, day)
             self._cycle_cache_hits += 1
             self.log(f"Cache hit for day {day_str}, generation: {generation}")
             return cached_data
@@ -476,8 +488,18 @@ class TauronAmiplusConnector:
             else:
                 for i, v in enumerate(values["data"]["allData"]):
                     v["Date"] = day.strftime("%Y-%m-%d")
-            if all(self.contains_data(a) for a in values["data"]["allData"]):
+                self.normalize_daily_data(values, day)
+
+            warsaw_tz = get_time_zone("Europe/Warsaw")
+            today = datetime.datetime.now(warsaw_tz).date()
+            all_data = values["data"].get("allData", [])
+            if (
+                day < today
+                and len(all_data) == expected_hours
+                and all(self.contains_data(a) for a in all_data)
+            ):
                 self._cache.add_value(day, generation, values)
+
             values["data"]["allData"] = [
                 d for d in values["data"]["allData"] if self.contains_data(d)
             ]
@@ -583,14 +605,96 @@ class TauronAmiplusConnector:
         raise Exception("Failed to calculate configuration")
 
     @staticmethod
-    def add_all_data(data: dict, date):
+    def get_expected_hours_for_day(date: datetime.date) -> int:
+        zone = get_time_zone("Europe/Warsaw")
+        start = datetime.datetime.combine(date, datetime.time(0, 0), tzinfo=zone)
+        end = datetime.datetime.combine(date + datetime.timedelta(days=1), datetime.time(0, 0), tzinfo=zone)
+        return int((as_utc(end) - as_utc(start)).total_seconds() // 3600)
+
+    @staticmethod
+    def normalize_daily_data(data: dict, date: datetime.date) -> None:
+        """Ensure allData has the expected number of hours for date (e.g. 25 for autumn DST, 23 for spring DST)."""
+        if "data" not in data or "allData" not in data["data"]:
+            return
+        all_data = data["data"]["allData"]
+        expected_hours = TauronAmiplusConnector.get_expected_hours_for_day(date)
+        if len(all_data) == expected_hours:
+            return
+
+        # Autumn DST: 25 hours expected, 24 provided
+        if expected_hours == 25 and len(all_data) == 24:
+            h3 = all_data[2]
+            try:
+                combined_ec = float(h3["EC"])
+                ec1 = round(combined_ec / 2.0, 3)
+                ec2 = round(combined_ec - ec1, 3)
+            except (ValueError, TypeError):
+                ec1 = h3.get("EC")
+                ec2 = h3.get("EC")
+
+            entry1 = {**h3, "EC": f"{ec1}", "Hour": 3}
+            entry2 = {**h3, "EC": f"{ec2}", "Hour": 4}
+
+            new_all_data = list(all_data[:2]) + [entry1, entry2]
+            for idx, item in enumerate(all_data[3:], start=5):
+                new_all_data.append({**item, "Hour": idx})
+            data["data"]["allData"] = new_all_data
+
+        # Spring DST: 23 hours expected, 24 provided
+        elif expected_hours == 23 and len(all_data) == 24:
+            new_all_data = list(all_data[:2])
+            for idx, item in enumerate(all_data[3:], start=3):
+                new_all_data.append({**item, "Hour": idx})
+            data["data"]["allData"] = new_all_data
+
+    @staticmethod
+    def add_all_data(data: dict, date: datetime.date):
         all_datas = []
-        zone = list(data['data']['zonesName'].keys())[0]
-        for i, v in enumerate(data["data"]["values"]):
-            if len(data['data']['zonesName']) > 0:
-                selected_zones = list(filter(lambda item: item[1][i], data["data"]["chartZones"].items()))
-                if len(selected_zones) > 0:
-                    zone = selected_zones[0][0]
+        raw_values = data["data"].get("values", [])
+        chart_zones = data["data"].get("chartZones", {})
+        zones_name = data["data"].get("zonesName", {})
+        zone = list(zones_name.keys())[0] if zones_name else "1"
+
+        expected_hours = TauronAmiplusConnector.get_expected_hours_for_day(date)
+
+        # Autumn DST: 24 raw values -> expand index 2 into two entries
+        if expected_hours == 25 and len(raw_values) == 24:
+            try:
+                combined = float(raw_values[2])
+                v1 = round(combined / 2.0, 3)
+                v2 = round(combined - v1, 3)
+            except (ValueError, TypeError):
+                v1 = raw_values[2]
+                v2 = raw_values[2]
+            values = list(raw_values[:2]) + [f"{v1}", f"{v2}"] + list(raw_values[3:])
+            expanded_zones = {}
+            for z_k, flags in chart_zones.items():
+                if len(flags) == 24:
+                    expanded_zones[z_k] = list(flags[:2]) + [flags[2], flags[2]] + list(flags[3:])
+                else:
+                    expanded_zones[z_k] = flags
+            chart_zones = expanded_zones
+        # Spring DST: 24 raw values -> remove index 2
+        elif expected_hours == 23 and len(raw_values) == 24:
+            values = list(raw_values[:2]) + list(raw_values[3:])
+            expanded_zones = {}
+            for z_k, flags in chart_zones.items():
+                if len(flags) == 24:
+                    expanded_zones[z_k] = list(flags[:2]) + list(flags[3:])
+                else:
+                    expanded_zones[z_k] = flags
+            chart_zones = expanded_zones
+        else:
+            values = list(raw_values)
+
+        for i, v in enumerate(values):
+            if len(zones_name) > 0 and chart_zones:
+                selected_zones = [
+                    z for z, flags in chart_zones.items()
+                    if i < len(flags) and flags[i]
+                ]
+                if selected_zones:
+                    zone = selected_zones[0]
             all_datas.append({
                 "EC": v,
                 "Date": date.strftime("%Y-%m-%d"),
