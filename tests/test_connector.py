@@ -395,3 +395,56 @@ async def test_get_raw_values_daily_for_day_accepts_datetime(mocker):
     result = await connector.get_raw_values_daily_for_day(sample_day, generation=False)
     assert result is not None
     assert connector._cache.get_value(sample_day, generation=False) is not None
+
+
+def test_normalize_daily_data_autumn_duplicate_hour_3():
+    # Tauron eLicznik API returns 25 records on autumn DST day with "Hour": 3 duplicated
+    date = datetime.date(2026, 10, 25)
+    data = {
+        "data": {
+            "allData": [
+                {"Date": "2026-10-25", "Hour": "1", "EC": "0.338", "Zone": "1", "Status": "0"},
+                {"Date": "2026-10-25", "Hour": "2", "EC": "0.394", "Zone": "1", "Status": "0"},
+                {"Date": "2026-10-25", "Hour": "3", "EC": "0.347", "Zone": "1", "Status": "0"},
+                {"Date": "2026-10-25", "Hour": "3", "EC": "0.333", "Zone": "1", "Status": "0"},
+            ] + [
+                {"Date": "2026-10-25", "Hour": str(h), "EC": "0.500", "Zone": "1", "Status": "0"}
+                for h in range(4, 25)
+            ]
+        }
+    }
+    assert len(data["data"]["allData"]) == 25
+    TauronAmiplusConnector.normalize_daily_data(data, date)
+    all_data = data["data"]["allData"]
+    assert len(all_data) == 25
+    # Verify hours are strictly sequential 1..25
+    hours = [item["Hour"] for item in all_data]
+    assert hours == list(range(1, 26))
+    assert all_data[2]["EC"] == "0.347" and all_data[2]["Hour"] == 3
+    assert all_data[3]["EC"] == "0.333" and all_data[3]["Hour"] == 4
+    assert all_data[24]["Hour"] == 25
+
+
+def test_normalize_daily_data_autumn_24_values_split():
+    # When raw API returns 24 values on autumn DST (Hour 3 combined)
+    date = datetime.date(2026, 10, 25)
+    data = {
+        "data": {
+            "allData": [
+                {"Date": "2026-10-25", "Hour": 1, "EC": "0.338", "Zone": "1", "Status": "0"},
+                {"Date": "2026-10-25", "Hour": 2, "EC": "0.394", "Zone": "1", "Status": "0"},
+                {"Date": "2026-10-25", "Hour": 3, "EC": "0.680", "Zone": "1", "Status": "0"},
+            ] + [
+                {"Date": "2026-10-25", "Hour": h, "EC": "0.500", "Zone": "1", "Status": "0"}
+                for h in range(4, 25)
+            ]
+        }
+    }
+    assert len(data["data"]["allData"]) == 24
+    TauronAmiplusConnector.normalize_daily_data(data, date)
+    all_data = data["data"]["allData"]
+    assert len(all_data) == 25
+    assert [item["Hour"] for item in all_data] == list(range(1, 26))
+    assert all_data[2]["EC"] == "0.34"
+    assert all_data[3]["EC"] == "0.34"
+

@@ -633,10 +633,8 @@ class TauronAmiplusConnector:
             date = date.date()
         all_data = data["data"]["allData"]
         expected_hours = TauronAmiplusConnector.get_expected_hours_for_day(date)
-        if len(all_data) == expected_hours:
-            return
 
-        # Autumn DST: 25 hours expected, 24 provided
+        # Autumn DST: 25 hours expected, 24 provided (index 2 contains combined 3:00 hours)
         if expected_hours == 25 and len(all_data) == 24:
             h3 = all_data[2]
             try:
@@ -647,20 +645,23 @@ class TauronAmiplusConnector:
                 ec1 = h3.get("EC")
                 ec2 = h3.get("EC")
 
-            entry1 = {**h3, "EC": f"{ec1}", "Hour": 3}
-            entry2 = {**h3, "EC": f"{ec2}", "Hour": 4}
+            entry1 = {**h3, "EC": f"{ec1}"}
+            entry2 = {**h3, "EC": f"{ec2}"}
+            all_data = list(all_data[:2]) + [entry1, entry2] + list(all_data[3:])
 
-            new_all_data = list(all_data[:2]) + [entry1, entry2]
-            for idx, item in enumerate(all_data[3:], start=5):
-                new_all_data.append({**item, "Hour": idx})
-            data["data"]["allData"] = new_all_data
-
-        # Spring DST: 23 hours expected, 24 provided
+        # Spring DST: 23 hours expected, 24 provided (index 2 contains non-existent 2:00-3:00 hour)
         elif expected_hours == 23 and len(all_data) == 24:
-            new_all_data = list(all_data[:2])
-            for idx, item in enumerate(all_data[3:], start=3):
-                new_all_data.append({**item, "Hour": idx})
-            data["data"]["allData"] = new_all_data
+            all_data = list(all_data[:2]) + list(all_data[3:])
+
+        # Renumber all items sequentially 1..expected_hours.
+        # This is essential on DST transition days where Tauron's raw API either repeats "Hour": 3
+        # (Autumn DST, 25 hours with two 3:00 entries) or skips hour 3 (Spring DST), ensuring
+        # distinct, monotonic hourly UTC timestamps without collisions, shifts, or negative deltas.
+        if len(all_data) == expected_hours:
+            for idx, item in enumerate(all_data, start=1):
+                item["Hour"] = idx
+
+        data["data"]["allData"] = all_data
 
     @staticmethod
     def add_all_data(data: dict, date: datetime.date | datetime.datetime):

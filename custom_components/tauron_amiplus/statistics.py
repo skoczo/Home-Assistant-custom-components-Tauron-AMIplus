@@ -440,22 +440,35 @@ class TauronAmiplusStatisticsUpdater:
                 {statistic_id},
                 "hour",
                 None,
-                {"state"},
+                {"state", "sum"},
             )
             if not stats or statistic_id not in stats:
                 return None
 
             records_by_date = collections.defaultdict(int)
+            prev_sum = None
+            inconsistent_dates = set()
             for r in stats[statistic_id]:
                 row_start = self._get_row_start(r)
                 if row_start is not None and start_utc <= row_start < end_utc:
                     row_date = row_start.astimezone(warsaw_tz).date()
                     records_by_date[row_date] += 1
+                    row_sum = r.get("sum")
+                    if row_sum is not None and prev_sum is not None and row_sum < prev_sum - 1e-4:
+                        inconsistent_dates.add(row_date)
+                    if row_sum is not None:
+                        prev_sum = row_sum
 
             curr = start_date
             while curr <= end_date:
                 expected = TauronAmiplusConnector.get_expected_hours_for_day(curr)
                 actual = records_by_date.get(curr, 0)
+                if curr in inconsistent_dates:
+                    _LOGGER.info(
+                        f"[{self.meter_id}] Detected inconsistent/decreasing sum in Recorder on {curr}. "
+                        f"Triggering self-healing from this date."
+                    )
+                    return curr
                 if 0 < actual < expected:
                     _LOGGER.info(
                         f"[{self.meter_id}] Detected incomplete day in Recorder for {curr}: "

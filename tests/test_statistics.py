@@ -640,3 +640,38 @@ async def test_find_earliest_incomplete_day(mocker):
     )
     assert incomplete_none is None
 
+
+async def test_find_earliest_incomplete_day_detects_decreasing_sum(mocker):
+    # Simulates corrupted Recorder state: 25 rows exist, but at hour 25 sum decreases (creating negative delta)
+    mock_hass = MagicMock()
+    mock_connector = AsyncMock()
+    updater = TauronAmiplusStatisticsUpdater(
+        mock_hass, mock_connector, "123456", "Dom", show_generation=False, show_balanced=False
+    )
+    stat_id = "tauron_importer:123456_consumption"
+
+    start_25 = datetime.datetime(2026, 10, 24, 22, 0, tzinfo=datetime.timezone.utc)
+    rows = []
+    current_sum = 100.0
+    for h in range(24):
+        current_sum += 0.5
+        rows.append({
+            "start": (start_25 + datetime.timedelta(hours=h)).timestamp(),
+            "sum": current_sum,
+        })
+    # 25th row has a lower sum (e.g. from an unupdated earlier sync), causing a drop
+    rows.append({
+        "start": (start_25 + datetime.timedelta(hours=24)).timestamp(),
+        "sum": current_sum - 0.307,
+    })
+
+    mock_recorder = MagicMock()
+    mock_recorder.async_add_executor_job = AsyncMock(return_value={stat_id: rows})
+    mocker.patch("custom_components.tauron_amiplus.statistics.get_instance", return_value=mock_recorder)
+
+    inconsistent = await updater.find_earliest_incomplete_day(
+        stat_id, datetime.date(2026, 10, 25), datetime.date(2026, 10, 26)
+    )
+    assert inconsistent == datetime.date(2026, 10, 25)
+
+
