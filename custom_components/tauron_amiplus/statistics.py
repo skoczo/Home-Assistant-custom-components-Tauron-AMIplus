@@ -59,14 +59,15 @@ class TauronAmiplusStatisticsUpdater:
         )
 
         data = await connector.get_raw_data()
+        start_date_obj = start_date.date() if isinstance(start_date, datetime.datetime) else start_date
         start_datetime = datetime.datetime.combine(
-            start_date, datetime.time(0, 0, tzinfo=get_time_zone("Europe/Warsaw"))
+            start_date_obj, datetime.time(0, 0, tzinfo=get_time_zone("Europe/Warsaw"))
         )
         if data is not None:
             await statistics_updater.update_all(data, start_datetime)
             await connector.async_save_cache()
 
-    async def update_all(self, last_data: TauronAmiplusRawData, start_date: datetime.datetime = None) -> None:
+    async def update_all(self, last_data: TauronAmiplusRawData, start_date: datetime.datetime | datetime.date = None) -> None:
         if last_data.consumption is None:
             return
 
@@ -85,8 +86,12 @@ class TauronAmiplusStatisticsUpdater:
 
         re_sync_from_time = None
         if start_date is not None:
-            fetch_from = start_date.astimezone(warsaw_tz).date()
-            start_date_utc = as_utc(start_date)
+            if isinstance(start_date, datetime.datetime):
+                fetch_from = start_date.astimezone(warsaw_tz).date()
+                start_date_utc = as_utc(start_date)
+            else:
+                fetch_from = start_date
+                start_date_utc = as_utc(datetime.datetime.combine(start_date, datetime.time(0, 0), tzinfo=warsaw_tz))
             re_sync_from_time = start_date_utc
             _LOGGER.info(f"[{self.meter_id}] Manual statistics update requested from {fetch_from}")
             for d in [fetch_from + datetime.timedelta(days=x) for x in range((yesterday - fetch_from).days + 1)]:

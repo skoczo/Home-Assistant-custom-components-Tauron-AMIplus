@@ -375,6 +375,23 @@ def test_dst_autumn_multizone_preservation():
     assert all_data[0]["Zone"] == "1"
     assert all_data[4]["Zone"] == "1"
 
+async def test_get_raw_values_daily_for_day_accepts_datetime(mocker):
+    connector = TauronAmiplusConnector(
+        "user", "pass", "12345", None, "entry_id"
+    )
+    # Provide a datetime.datetime object
+    sample_day = datetime.datetime(2026, 10, 20, 10, 30, tzinfo=datetime.timezone.utc)
+    fake_data = {
+        "data": {
+            "allData": [{"Date": "2026-10-20", "Hour": h, "EC": "0.1", "Zone": "1", "Status": "OK"} for h in range(1, 25)],
+            "sum": 2.4,
+            "zones": {"1": 2.4},
+            "zonesName": {"1": "G11"},
+        }
+    }
+    mocker.patch.object(connector, "get_chart_values", return_value=fake_data)
 
-
-
+    # Calling with datetime.datetime must not raise TypeError when comparing day < today
+    result = await connector.get_raw_values_daily_for_day(sample_day, generation=False)
+    assert result is not None
+    assert connector._cache.get_value(sample_day, generation=False) is not None

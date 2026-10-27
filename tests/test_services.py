@@ -81,3 +81,50 @@ def test_register_all_services(mocker):
 
     register_all_services(mock_hass)
     assert mock_hass.services.async_register.call_count == 2
+
+async def test_manually_update_end_to_end(mocker):
+    from custom_components.tauron_amiplus.statistics import TauronAmiplusStatisticsUpdater
+    from custom_components.tauron_amiplus.connector import TauronAmiplusRawData, TauronAmiplusDataSet
+    from homeassistant.const import CONF_USERNAME, CONF_PASSWORD
+    from custom_components.tauron_amiplus.const import CONF_METER_ID, CONF_METER_NAME, CONF_TARIFF
+
+    mock_hass = MagicMock()
+    mock_entry = MagicMock()
+    mock_entry.data = {
+        CONF_USERNAME: "user",
+        CONF_PASSWORD: "pass",
+        CONF_METER_ID: "12345",
+        CONF_METER_NAME: "Dom",
+        CONF_TARIFF: "G11",
+    }
+    mock_entry.options = {}
+    mock_entry.entry_id = "entry_123"
+
+    raw_data = TauronAmiplusRawData()
+    raw_data.consumption = TauronAmiplusDataSet()
+    raw_data.consumption.json_daily = {"data": {"zonesName": {"1": "G11"}}}
+
+    mocker.patch(
+        "custom_components.tauron_amiplus.connector.TauronAmiplusConnector.get_raw_data",
+        new=AsyncMock(return_value=raw_data),
+    )
+    mocker.patch(
+        "custom_components.tauron_amiplus.connector.TauronAmiplusConnector.async_save_cache",
+        new=AsyncMock(),
+    )
+    mock_update_all = mocker.patch.object(
+        TauronAmiplusStatisticsUpdater, "update_all", new=AsyncMock()
+    )
+
+    # Test with datetime.date
+    await TauronAmiplusStatisticsUpdater.manually_update(
+        mock_hass, datetime.date(2026, 10, 24), mock_entry
+    )
+    assert mock_update_all.call_count == 1
+
+    # Test with datetime.datetime
+    await TauronAmiplusStatisticsUpdater.manually_update(
+        mock_hass, datetime.datetime(2026, 10, 24, 0, 0), mock_entry
+    )
+    assert mock_update_all.call_count == 2
+

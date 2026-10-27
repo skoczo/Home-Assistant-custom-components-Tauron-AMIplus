@@ -395,32 +395,41 @@ class TauronAmiplusConnector:
         return data, day
 
     async def get_raw_values_daily(self, days_before, generation):
-        day = datetime.datetime.now() - datetime.timedelta(days_before)
+        warsaw_tz = get_time_zone("Europe/Warsaw")
+        day = (datetime.datetime.now(warsaw_tz) - datetime.timedelta(days_before)).date()
         return await self.get_raw_values_daily_for_day(day, generation), TauronAmiplusConnector.format_date(day)
 
     async def get_values_month_hourly(self, generation):
-        now = datetime.datetime.now()
+        warsaw_tz = get_time_zone("Europe/Warsaw")
+        now = datetime.datetime.now(warsaw_tz).date()
         start_day = now.replace(day=1)
         return await self.get_raw_values_daily_for_range(start_day, now, generation)
 
     async def get_values_year_hourly(self, generation):
-        now = datetime.datetime.now()
+        warsaw_tz = get_time_zone("Europe/Warsaw")
+        now = datetime.datetime.now(warsaw_tz).date()
         start_day = now.replace(day=1, month=1)
         return await self.get_raw_values_daily_for_range(start_day, now, generation)
 
     async def get_values_last_30_days_hourly(self, generation):
-        now = datetime.datetime.now()
+        warsaw_tz = get_time_zone("Europe/Warsaw")
+        now = datetime.datetime.now(warsaw_tz).date()
         start_day = now - datetime.timedelta(days=30)
         return await self.get_raw_values_daily_for_range(start_day, now, generation)
 
     async def get_values_12_months_hourly(self, generation):
-        now = datetime.datetime.now()
+        warsaw_tz = get_time_zone("Europe/Warsaw")
+        now = datetime.datetime.now(warsaw_tz).date()
         start_day = now.replace(year=now.year - 1)
         return await self.get_raw_values_daily_for_range(start_day, now, generation)
 
     async def get_raw_values_daily_for_range(
-        self, day_from: datetime.date, day_to: datetime.date, generation: bool, only_complete_days: bool = False
+        self, day_from: datetime.date | datetime.datetime, day_to: datetime.date | datetime.datetime, generation: bool, only_complete_days: bool = False
     ):
+        if isinstance(day_from, datetime.datetime):
+            day_from = day_from.date()
+        if isinstance(day_to, datetime.datetime):
+            day_to = day_to.date()
         data = {"data": {
             "allData": [],
             "sum": 0,
@@ -452,7 +461,9 @@ class TauronAmiplusConnector:
             return None
         return data
 
-    async def get_raw_values_daily_for_day(self, day, generation: bool):
+    async def get_raw_values_daily_for_day(self, day: datetime.date | datetime.datetime, generation: bool):
+        if isinstance(day, datetime.datetime):
+            day = day.date()
         day_str = TauronAmiplusConnector.format_date(day)
         expected_hours = self.get_expected_hours_for_day(day)
         cached_data = self._cache.get_value(day, generation)
@@ -605,17 +616,21 @@ class TauronAmiplusConnector:
         raise Exception("Failed to calculate configuration")
 
     @staticmethod
-    def get_expected_hours_for_day(date: datetime.date) -> int:
+    def get_expected_hours_for_day(date: datetime.date | datetime.datetime) -> int:
+        if isinstance(date, datetime.datetime):
+            date = date.date()
         zone = get_time_zone("Europe/Warsaw")
         start = datetime.datetime.combine(date, datetime.time(0, 0), tzinfo=zone)
         end = datetime.datetime.combine(date + datetime.timedelta(days=1), datetime.time(0, 0), tzinfo=zone)
         return int((as_utc(end) - as_utc(start)).total_seconds() // 3600)
 
     @staticmethod
-    def normalize_daily_data(data: dict, date: datetime.date) -> None:
+    def normalize_daily_data(data: dict, date: datetime.date | datetime.datetime) -> None:
         """Ensure allData has the expected number of hours for date (e.g. 25 for autumn DST, 23 for spring DST)."""
         if "data" not in data or "allData" not in data["data"]:
             return
+        if isinstance(date, datetime.datetime):
+            date = date.date()
         all_data = data["data"]["allData"]
         expected_hours = TauronAmiplusConnector.get_expected_hours_for_day(date)
         if len(all_data) == expected_hours:
@@ -648,7 +663,9 @@ class TauronAmiplusConnector:
             data["data"]["allData"] = new_all_data
 
     @staticmethod
-    def add_all_data(data: dict, date: datetime.date):
+    def add_all_data(data: dict, date: datetime.date | datetime.datetime):
+        if isinstance(date, datetime.datetime):
+            date = date.date()
         all_datas = []
         raw_values = data["data"].get("values", [])
         chart_zones = data["data"].get("chartZones", {})
