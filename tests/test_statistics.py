@@ -474,8 +474,8 @@ async def test_statistics_self_healing_dst_day(mocker):
         },
     )
 
-    # In Recorder, only 24 hours exist for 2026-10-25 (missing the 01:00 UTC gap)
-    mocker.patch.object(updater, "get_stats_count_in_range", return_value=24)
+    # In Recorder, 2026-10-25 is detected as incomplete (missing the 01:00 UTC gap)
+    mocker.patch.object(updater, "find_earliest_incomplete_day", return_value=datetime.date(2026, 10, 25))
 
     # Baseline before 2026-10-25 (end of 2026-10-24)
     baseline_time = datetime.datetime(2026, 10, 24, 21, 0, tzinfo=datetime.timezone.utc)
@@ -506,7 +506,7 @@ async def test_statistics_self_healing_dst_day(mocker):
     await updater.update_all(raw_data)
 
     # Should detect incomplete count (24 < 25), delete cache for 2026-10-25, and rewrite all 25 hours
-    mock_connector._cache.delete_day.assert_called_with(datetime.date(2026, 10, 25))
+    mock_connector._cache.delete_day.assert_any_call(datetime.date(2026, 10, 25))
     mock_add_stats.assert_called_once()
     stats_data = mock_add_stats.call_args[0][2]
     assert len(stats_data) == 25
@@ -595,3 +595,48 @@ def test_dst_autumn_balanced_25_hours():
     for c, g in zip(b_cons, b_gen):
         assert c["EC"] == "1.0"
         assert g["EC"] == "0"
+
+
+async def test_find_earliest_incomplete_day(mocker):
+    mock_hass = MagicMock()
+    mock_connector = AsyncMock()
+    updater = TauronAmiplusStatisticsUpdater(
+        mock_hass, mock_connector, "123456", "Dom", show_generation=False, show_balanced=False
+    )
+    stat_id = "tauron_importer:123456_consumption"
+
+    # Suppose 2026-10-24 has 24 hours, 2026-10-25 has 24 hours (incomplete, expects 25), 2026-10-26 has 24 hours
+    warsaw_tz = get_time_zone("Europe/Warsaw")
+    rows = []
+    # 2026-10-24: 24 hours (starting 2026-10-23 22:00 UTC)
+    start_24 = datetime.datetime(2026, 10, 23, 22, 0, tzinfo=datetime.timezone.utc)
+    for h in range(24):
+        rows.append({"start": (start_24 + datetime.timedelta(hours=h)).timestamp()})
+
+    # 2026-10-25: only 24 hours recorded (missing the 25th / gap hour)
+    start_25 = datetime.datetime(2026, 10, 24, 22, 0, tzinfo=datetime.timezone.utc)
+    for h in range(24):
+        rows.append({"start": (start_25 + datetime.timedelta(hours=h)).timestamp()})
+
+    # 2026-10-26: 24 hours
+    start_26 = datetime.datetime(2026, 10, 25, 23, 0, tzinfo=datetime.timezone.utc)
+    for h in range(24):
+        rows.append({"start": (start_26 + datetime.timedelta(hours=h)).timestamp()})
+
+    mock_recorder = MagicMock()
+    mock_recorder.async_add_executor_job = AsyncMock(return_value={stat_id: rows})
+    mocker.patch("custom_components.tauron_amiplus.statistics.get_instance", return_value=mock_recorder)
+
+    incomplete = await updater.find_earliest_incomplete_day(
+        stat_id, datetime.date(2026, 10, 24), datetime.date(2026, 10, 26)
+    )
+    assert incomplete == datetime.date(2026, 10, 25)
+
+    # When 2026-10-25 also has 25 hours, nothing is incomplete
+    rows.append({"start": (start_25 + datetime.timedelta(hours=24)).timestamp()})
+    mock_recorder.async_add_executor_job = AsyncMock(return_value={stat_id: rows})
+    incomplete_none = await updater.find_earliest_incomplete_day(
+        stat_id, datetime.date(2026, 10, 24), datetime.date(2026, 10, 26)
+    )
+    assert incomplete_none is None
+

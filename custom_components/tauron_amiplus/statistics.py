@@ -1,4 +1,6 @@
+import collections
 import datetime
+import inspect
 import logging
 
 from homeassistant.components.recorder import get_instance
@@ -26,6 +28,12 @@ class TauronAmiplusStatisticsUpdater:
         self.meter_name = meter_name
         self.show_generation = show_generation
         self.show_balanced = show_balanced
+
+    async def _safe_delete_cache_day(self, day: datetime.date) -> None:
+        if hasattr(self.connector, "_cache") and self.connector._cache is not None:
+            res = self.connector._cache.delete_day(day)
+            if inspect.isawaitable(res):
+                await res
 
     @staticmethod
     async def manually_update(hass, start_date: datetime.date, entry) -> None:
@@ -73,6 +81,7 @@ class TauronAmiplusStatisticsUpdater:
         warsaw_tz = get_time_zone("Europe/Warsaw")
         now = datetime.datetime.now(warsaw_tz)
         yesterday = (now - datetime.timedelta(days=1)).date()
+        max_history_date = (now - datetime.timedelta(days=365)).date()
 
         re_sync_from_time = None
         if start_date is not None:
@@ -80,29 +89,34 @@ class TauronAmiplusStatisticsUpdater:
             start_date_utc = as_utc(start_date)
             re_sync_from_time = start_date_utc
             _LOGGER.info(f"[{self.meter_id}] Manual statistics update requested from {fetch_from}")
+            for d in [fetch_from + datetime.timedelta(days=x) for x in range((yesterday - fetch_from).days + 1)]:
+                await self._safe_delete_cache_day(d)
         else:
             has_all_stats = all(v["last_stats_time"] is not None for v in all_stat_ids.values())
             if has_all_stats:
                 min_last_time = min(v["last_stats_time"] for v in all_stat_ids.values())
                 min_last_date = min_last_time.astimezone(warsaw_tz).date()
-                fetch_from = min_last_date - datetime.timedelta(days=1)
                 _LOGGER.info(
                     f"[{self.meter_id}] Checking long-term statistics in Recorder: "
                     f"last recorded timestamp is {min_last_time}"
                 )
-                expected_hours = TauronAmiplusConnector.get_expected_hours_for_day(min_last_date)
-                day_start_utc = as_utc(datetime.datetime.combine(min_last_date, datetime.time(0, 0), tzinfo=warsaw_tz))
-                day_end_utc = day_start_utc + datetime.timedelta(hours=expected_hours)
+                check_start = max(min_last_date - datetime.timedelta(days=7), max_history_date)
                 primary_stat_id = self.get_stats_id(CONST_CONSUMPTION)
-                count = await self.get_stats_count_in_range(primary_stat_id, day_start_utc, day_end_utc)
-                if 0 < count < expected_hours:
-                    _LOGGER.info(
-                        f"[{self.meter_id}] Last recorded date {min_last_date} is incomplete in Recorder "
-                        f"({count}/{expected_hours} hours). Re-syncing from {min_last_date} to heal missing data."
+                earliest_incomplete = await self.find_earliest_incomplete_day(
+                    primary_stat_id, check_start, yesterday
+                )
+                if earliest_incomplete is not None:
+                    fetch_from = earliest_incomplete
+                    re_sync_from_time = as_utc(
+                        datetime.datetime.combine(earliest_incomplete, datetime.time(0, 0), tzinfo=warsaw_tz)
                     )
-                    re_sync_from_time = day_start_utc
-                    if hasattr(self.connector, "_cache") and self.connector._cache is not None:
-                        self.connector._cache.delete_day(min_last_date)
+                    _LOGGER.info(
+                        f"[{self.meter_id}] Re-syncing and healing statistics starting from {fetch_from}"
+                    )
+                    for d in [fetch_from + datetime.timedelta(days=x) for x in range((yesterday - fetch_from).days + 1)]:
+                        await self._safe_delete_cache_day(d)
+                else:
+                    fetch_from = min_last_date - datetime.timedelta(days=1)
             else:
                 # First run or missing stats: fetch default range (30 days back)
                 fetch_from = (now - datetime.timedelta(days=30)).date()
@@ -112,7 +126,6 @@ class TauronAmiplusStatisticsUpdater:
                 )
 
         # Guard against excessively old query ranges
-        max_history_date = (now - datetime.timedelta(days=365)).date()
         if fetch_from < max_history_date:
             fetch_from = max_history_date
 
@@ -403,6 +416,52 @@ class TauronAmiplusStatisticsUpdater:
             _LOGGER.warning(f"Failed to query statistics before {before_time} for {statistic_id}: {e}")
 
         return 0.0, None
+
+    async def find_earliest_incomplete_day(
+        self, statistic_id: str, start_date: datetime.date, end_date: datetime.date
+    ) -> datetime.date | None:
+        """Find the earliest day in [start_date, end_date] with partial/incomplete hours in Recorder."""
+        warsaw_tz = get_time_zone("Europe/Warsaw")
+        start_utc = as_utc(datetime.datetime.combine(start_date, datetime.time(0, 0), tzinfo=warsaw_tz))
+        expected_end_hours = TauronAmiplusConnector.get_expected_hours_for_day(end_date)
+        end_utc = as_utc(datetime.datetime.combine(end_date, datetime.time(0, 0), tzinfo=warsaw_tz)) + datetime.timedelta(hours=expected_end_hours)
+
+        try:
+            stats = await get_instance(self.hass).async_add_executor_job(
+                statistics_during_period,
+                self.hass,
+                start_utc,
+                end_utc,
+                {statistic_id},
+                "hour",
+                None,
+                {"state"},
+            )
+            if not stats or statistic_id not in stats:
+                return None
+
+            records_by_date = collections.defaultdict(int)
+            for r in stats[statistic_id]:
+                row_start = self._get_row_start(r)
+                if row_start is not None and start_utc <= row_start < end_utc:
+                    row_date = row_start.astimezone(warsaw_tz).date()
+                    records_by_date[row_date] += 1
+
+            curr = start_date
+            while curr <= end_date:
+                expected = TauronAmiplusConnector.get_expected_hours_for_day(curr)
+                actual = records_by_date.get(curr, 0)
+                if 0 < actual < expected:
+                    _LOGGER.info(
+                        f"[{self.meter_id}] Detected incomplete day in Recorder for {curr}: "
+                        f"{actual}/{expected} hours recorded. Triggering self-healing from this date."
+                    )
+                    return curr
+                curr += datetime.timedelta(days=1)
+        except Exception as e:
+            _LOGGER.debug(f"Failed to check for incomplete days in Recorder: {e}")
+
+        return None
 
     async def get_stats_count_in_range(
         self, statistic_id: str, start_time: datetime.datetime, end_time: datetime.datetime
