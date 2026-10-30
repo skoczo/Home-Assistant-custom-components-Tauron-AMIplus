@@ -128,3 +128,27 @@ async def test_coordinator_update_method_sets_smart_interval(mocker):
     assert coordinator.update_interval > datetime.timedelta(seconds=0)
 
 
+async def test_coordinator_update_failure_sets_retry_interval(mocker):
+    mock_hass = MagicMock()
+    mock_connector_cls = mocker.patch("custom_components.tauron_amiplus.coordinator.TauronAmiplusConnector")
+    mock_connector = mock_connector_cls.return_value
+    mock_connector.get_raw_data = AsyncMock(side_effect=Exception("Cannot write to closing transport"))
+
+    coordinator = TauronAmiplusUpdateCoordinator(
+        mock_hass,
+        "entry123",
+        "user",
+        "pass",
+        "12345",
+        "Dom",
+        config_entry=MagicMock(),
+    )
+
+    with pytest.raises(Exception, match="Cannot write to closing transport"):
+        await coordinator.update_method()
+
+    # On error, update_interval should be set to 30 minutes
+    assert coordinator.update_interval == datetime.timedelta(minutes=30)
+
+
+

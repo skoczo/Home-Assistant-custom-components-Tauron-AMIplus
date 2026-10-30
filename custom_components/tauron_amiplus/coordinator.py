@@ -95,12 +95,20 @@ class TauronAmiplusUpdateCoordinator(DataUpdateCoordinator[TauronAmiplusRawData]
     async def update_method(self) -> TauronAmiplusRawData:
         start_time = time.monotonic()
         _LOGGER.info(f"[{self.meter_id}] Starting data update from Tauron eLicznik")
-        data = await self._update()
-        if data is not None and self.store_statistics:
-            self.log("Starting statistics update")
-            await self.generate_statistics(data)
-            self.log("Updated all statistics")
-        await self.connector.async_save_cache()
+        try:
+            data = await self._update()
+            if data is not None and self.store_statistics:
+                self.log("Starting statistics update")
+                await self.generate_statistics(data)
+                self.log("Updated all statistics")
+            await self.connector.async_save_cache()
+        except Exception as err:
+            self.update_interval = datetime.timedelta(minutes=30)
+            _LOGGER.warning(
+                f"[{self.meter_id}] Update failed ({err}). Will retry in 30 minutes."
+            )
+            raise
+
         elapsed = time.monotonic() - start_time
 
         warsaw_tz = get_time_zone("Europe/Warsaw")

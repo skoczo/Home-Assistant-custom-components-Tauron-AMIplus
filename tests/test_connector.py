@@ -448,3 +448,28 @@ def test_normalize_daily_data_autumn_24_values_split():
     assert all_data[2]["EC"] == "0.34"
     assert all_data[3]["EC"] == "0.34"
 
+
+async def test_execute_post_retry_on_client_os_error(mocker):
+    from aiohttp import ClientOSError
+    from unittest.mock import AsyncMock, MagicMock
+
+    connector = TauronAmiplusConnector(
+        "user", "pass", "12345", MagicMock(), "entry123"
+    )
+    mock_session = MagicMock()
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.text.return_value = '{"success":true,"data":{"sum":1.0}}'
+    mock_response.json.return_value = {"success": True, "data": {"sum": 1.0}}
+
+    # First attempt raises ClientOSError ("Cannot write to closing transport"), second attempt succeeds
+    mock_session.request = AsyncMock(
+        side_effect=[ClientOSError("Cannot write to closing transport"), mock_response]
+    )
+    connector._session = mock_session
+
+    result = await connector.execute_post("https://example.com/api", {"test": 1})
+    assert result == {"success": True, "data": {"sum": 1.0}}
+    assert mock_session.request.call_count == 2
+
+

@@ -1,4 +1,4 @@
-"""Update coordinator for TAURON sensors."""
+import asyncio
 import copy
 import datetime
 import json
@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Tuple, Any
 
-from aiohttp import ClientSession
+from aiohttp import ClientError, ClientOSError, ClientSession, ServerDisconnectedError
 # from bs4 import BeautifulSoup
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -287,9 +287,13 @@ class TauronAmiplusConnector:
         await store.async_save({"cookies": cookies})
 
     async def validate_session(self, session: ClientSession, service: str) -> (bool, str):
-        response = await session.get(service)
-        response_text = await response.text()
-        return self._username in response_text or self._username.upper() in response_text.upper(), response_text
+        try:
+            response = await session.get(service)
+            response_text = await response.text()
+            return self._username in response_text or self._username.upper() in response_text.upper(), response_text
+        except (ClientOSError, ServerDisconnectedError, ClientError) as err:
+            self.log(f"Session validation error ({err})")
+            return False, ""
 
     async def login(self):
         session, login_response_text = await self.login_service(CONST_URL_LOGIN, CONST_URL_SERVICE)
@@ -303,7 +307,19 @@ class TauronAmiplusConnector:
         else:
             self._is_business = False
         self.log(f"Selecting meter: {self._meter_id}")
-        select_response = await self._session.request("POST", CONST_URL_SELECT_METER, data=payload_select_meter, headers=CONST_REQUEST_HEADERS)
+        select_response = None
+        for attempt in range(2):
+            try:
+                select_response = await self._session.request(
+                    "POST", CONST_URL_SELECT_METER, data=payload_select_meter, headers=CONST_REQUEST_HEADERS
+                )
+                break
+            except (ClientOSError, ServerDisconnectedError) as err:
+                if attempt == 0:
+                    self.log(f"Transient connection error ({err}) on select meter, retrying once...")
+                    await asyncio.sleep(1)
+                    continue
+                raise
         select_response_text = await select_response.text()
         tariff_search = re.findall(r"[^_]Tariff: '(.*)',", select_response_text)
         if len(tariff_search) > 0:
@@ -552,12 +568,22 @@ class TauronAmiplusConnector:
 
     async def execute_post(self, url: str, payload: dict):
         self.log(f"EXECUTING: {url} with payload: {payload}")
-        response = await self._session.request(
-            "POST",
-            url,
-            data=payload,
-            headers=CONST_REQUEST_HEADERS,
-        )
+        response = None
+        for attempt in range(2):
+            try:
+                response = await self._session.request(
+                    "POST",
+                    url,
+                    data=payload,
+                    headers=CONST_REQUEST_HEADERS,
+                )
+                break
+            except (ClientOSError, ServerDisconnectedError) as err:
+                if attempt == 0:
+                    self.log(f"Transient connection error ({err}) on POST {url}, retrying once...")
+                    await asyncio.sleep(1)
+                    continue
+                raise
         response_text = await response.text()
         self.log(f"RESPONSE: {response_text}")
         if "Przekroczono maksymalną liczbę logowań." in response_text:

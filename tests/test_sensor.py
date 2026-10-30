@@ -72,3 +72,76 @@ def test_get_balanced_data_missing_zone_key():
     assert balance == 1.0
     assert "zone_2_consumption" in zones
     assert zones["zone_2_consumption"] == 1.0
+
+
+async def test_sensor_restore_state(mocker):
+    from unittest.mock import AsyncMock, MagicMock
+    from homeassistant.components.sensor import SensorStateClass
+    from homeassistant.core import State
+
+    mock_coord = MagicMock()
+    mock_coord.data = None
+    mock_coord.last_update_success = False
+    mock_coord.async_add_listener = MagicMock(return_value=lambda: None)
+
+    sensor = TauronAmiplusSensor(
+        mock_coord,
+        "Dom",
+        "12345",
+        "configurable_balance",
+        SensorStateClass.TOTAL,
+    )
+    sensor.hass = MagicMock()
+
+    # Before restore, state is None, available is False
+    assert sensor.native_value is None
+    assert sensor.available is False
+
+    # Mock restored state from HA recorder/restore_state
+    restored_state = State(
+        "sensor.tauron_amiplus_dom_configurable_balance",
+        "42.123",
+        {
+            "tariff": "G11",
+            "sum_consumption": 100.5,
+            "sum_generation": -50.2,
+            "state_class": "total",
+            "unit_of_measurement": "kWh",
+        },
+    )
+    sensor.async_get_last_state = AsyncMock(return_value=restored_state)
+
+    await sensor.async_added_to_hass()
+
+    assert sensor.native_value == 42.123
+    assert sensor.extra_state_attributes["tariff"] == "G11"
+    assert sensor.extra_state_attributes["sum_consumption"] == 100.5
+    assert sensor.extra_state_attributes["sum_generation"] == -50.2
+    # Even though coordinator.last_update_success is False, restored state keeps entity available!
+    assert sensor.available is True
+
+
+async def test_sensor_restore_state_skipped_if_coord_has_data(mocker):
+    from unittest.mock import AsyncMock, MagicMock
+    from homeassistant.components.sensor import SensorStateClass
+    from custom_components.tauron_amiplus.connector import TauronAmiplusRawData
+
+    mock_coord = MagicMock()
+    mock_coord.data = TauronAmiplusRawData()
+    mock_coord.last_update_success = True
+    mock_coord.async_add_listener = MagicMock(return_value=lambda: None)
+
+    sensor = TauronAmiplusSensor(
+        mock_coord,
+        "Dom",
+        "12345",
+        "configurable_balance",
+        SensorStateClass.TOTAL,
+    )
+    sensor.hass = MagicMock()
+    sensor.async_get_last_state = AsyncMock()
+
+    await sensor.async_added_to_hass()
+    sensor.async_get_last_state.assert_not_called()
+    assert sensor.available is True
+
