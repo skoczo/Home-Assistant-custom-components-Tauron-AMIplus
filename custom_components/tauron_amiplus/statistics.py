@@ -73,9 +73,9 @@ class TauronAmiplusStatisticsUpdater:
 
         zones = {}
         if last_data.consumption.json_daily and "data" in last_data.consumption.json_daily:
-            zones = last_data.consumption.json_daily["data"].get("zonesName", {})
+            _, zones = TauronAmiplusConnector.daily_zone_keys(last_data.consumption.json_daily["data"])
         if not zones and last_data.consumption.json_monthly and "data" in last_data.consumption.json_monthly:
-            zones = last_data.consumption.json_monthly["data"].get("zonesName", {})
+            _, zones = TauronAmiplusConnector.daily_zone_keys(last_data.consumption.json_monthly["data"])
 
         all_stat_ids = await self.prepare_stats_ids(zones)
 
@@ -83,6 +83,7 @@ class TauronAmiplusStatisticsUpdater:
         now = datetime.datetime.now(warsaw_tz)
         yesterday = (now - datetime.timedelta(days=1)).date()
         max_history_date = (now - datetime.timedelta(days=365)).date()
+        initial_fetch_from = (now - datetime.timedelta(days=30)).date()
 
         re_sync_from_time = None
         if start_date is not None:
@@ -124,7 +125,7 @@ class TauronAmiplusStatisticsUpdater:
                     fetch_from = min_last_date - datetime.timedelta(days=1)
             else:
                 # First run or missing stats: fetch default range (30 days back)
-                fetch_from = (now - datetime.timedelta(days=30)).date()
+                fetch_from = initial_fetch_from
                 _LOGGER.info(
                     f"[{self.meter_id}] Checking long-term statistics in Recorder: "
                     f"initial sync for range {fetch_from} to {yesterday}"
@@ -139,25 +140,46 @@ class TauronAmiplusStatisticsUpdater:
             _LOGGER.info(f"[{self.meter_id}] Statistics are already up to date up to yesterday ({fetch_to}).")
             return
 
-        self.log(f"Fetching raw daily energy data for range: {fetch_from} to {fetch_to}")
-
-        data_consumption = await self.connector.get_raw_values_daily_for_range(
-            fetch_from, fetch_to, False, only_complete_days=True
-        )
-        if data_consumption is None or not data_consumption.get("data", {}).get("allData"):
-            _LOGGER.info(f"[{self.meter_id}] No new consumption data available from Tauron for range {fetch_from} to {fetch_to}")
-            return
-
-        raw_data = {CONST_CONSUMPTION: data_consumption["data"]["allData"]}
-
-        if self.show_generation or self.show_balanced:
-            data_generation = await self.connector.get_raw_values_daily_for_range(
-                fetch_from, fetch_to, True, only_complete_days=True
+        while True:
+            self.log(f"Fetching raw daily energy data for range: {fetch_from} to {fetch_to}")
+            data_consumption = await self.connector.get_raw_values_daily_for_range(
+                fetch_from, fetch_to, False, only_complete_days=True
             )
-            if data_generation is not None and data_generation.get("data", {}).get("allData"):
-                raw_data[CONST_GENERATION] = data_generation["data"]["allData"]
-            else:
-                raw_data[CONST_GENERATION] = []
+            if data_consumption is None or not data_consumption.get("data", {}).get("allData"):
+                _LOGGER.info(f"[{self.meter_id}] No new consumption data available from Tauron for range {fetch_from} to {fetch_to}")
+                return
+
+            raw_data = {CONST_CONSUMPTION: data_consumption["data"]["allData"]}
+            range_zones = dict(data_consumption["data"].get("zonesName", {}))
+
+            if self.show_generation or self.show_balanced:
+                data_generation = await self.connector.get_raw_values_daily_for_range(
+                    fetch_from, fetch_to, True, only_complete_days=True
+                )
+                generation_payload = data_generation.get("data", {}) if data_generation else {}
+                raw_data[CONST_GENERATION] = generation_payload.get("allData", [])
+                range_zones.update(generation_payload.get("zonesName", {}))
+
+            if range_zones.keys() - zones.keys():
+                zones.update(range_zones)
+                all_stat_ids = await self.prepare_stats_ids(zones)
+
+            if re_sync_from_time is None:
+                # Newly discovered series may have no cursor or may be
+                # behind the total. Do not advance past unfetched hours.
+                required_from = fetch_from
+                for stats in all_stat_ids.values():
+                    last = stats["last_stats_time"]
+                    series_from = (
+                        last.astimezone(warsaw_tz).date() - datetime.timedelta(days=1)
+                        if last is not None else initial_fetch_from
+                    )
+                    required_from = min(required_from, series_from)
+                required_from = max(required_from, max_history_date)
+                if required_from < fetch_from:
+                    fetch_from = required_from
+                    continue
+            break
 
         if self.show_balanced:
             balanced_consumption, balanced_generation = self.prepare_balanced_raw_data(raw_data)
@@ -306,26 +328,26 @@ class TauronAmiplusStatisticsUpdater:
                     "EC": f"{balance}",
                     "Date": consumption["Date"],
                     "Hour": consumption["Hour"],
-                    "Zone": consumption["Zone"],
+                    "Zone": consumption.get("ZoneKey", consumption["Zone"]),
                 }
                 output_generation = {
                     "EC": "0",
                     "Date": generation["Date"],
                     "Hour": generation["Hour"],
-                    "Zone": generation["Zone"],
+                    "Zone": generation.get("ZoneKey", generation["Zone"]),
                 }
             else:
                 output_consumption = {
                     "EC": "0",
                     "Date": consumption["Date"],
                     "Hour": consumption["Hour"],
-                    "Zone": consumption["Zone"],
+                    "Zone": consumption.get("ZoneKey", consumption["Zone"]),
                 }
                 output_generation = {
                     "EC": f"{-balance}",
                     "Date": generation["Date"],
                     "Hour": generation["Hour"],
-                    "Zone": generation["Zone"],
+                    "Zone": generation.get("ZoneKey", generation["Zone"]),
                 }
             balanced_consumption.append(output_consumption)
             balanced_generation.append(output_generation)
@@ -350,7 +372,7 @@ class TauronAmiplusStatisticsUpdater:
             if last_stats_time is not None and start <= last_stats_time:
                 continue
             usage = float(raw_hour["EC"])
-            if zone_id is not None and raw_hour["Zone"] != zone_id:
+            if zone_id is not None and raw_hour.get("ZoneKey", raw_hour["Zone"]) != zone_id:
                 usage = 0.0
             current_sum += usage
             stats = {

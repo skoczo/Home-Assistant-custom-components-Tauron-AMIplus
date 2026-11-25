@@ -467,20 +467,79 @@ class TauronAmiplusConnector:
                         self.log(f"Skipping incomplete day {day} from range ({len(day_all_data)}/{expected_hours} hours)")
                         continue
 
-                data["data"]["allData"].extend(day_all_data)
-                data["data"]["sum"] += day_data["data"]["sum"]
-                data["data"]["zonesName"] = {**(day_data["data"]["zonesName"]), **(data["data"]["zonesName"])}
-                if "tariff" in day_data["data"]:
-                    data["data"]["tariff"] = day_data["data"]["tariff"]
-                for z, v in day_data["data"]["zones"].items():
-                    if z in data["data"]["zones"]:
-                        data["data"]["zones"][z] += v
-                    else:
-                        data["data"]["zones"][z] = v
+                day_payload = day_data["data"]
+                keys, names = self.daily_zone_keys(day_payload)
+                result = data["data"]
+                for row in day_all_data:
+                    local = str(row.get("Zone", ""))
+                    result["allData"].append({**row, "ZoneKey": keys.get(local, local)})
+                result["sum"] += day_payload["sum"]
+                if "tariff" in day_payload:
+                    result["tariff"] = day_payload["tariff"]
+                result["zonesName"].update(names)
+                # The daily totals are authoritative, even for a partial day.
+                for zone, value in day_payload["zones"].items():
+                    key = keys.get(str(zone), str(zone))
+                    result["zones"][key] = result["zones"].get(key, 0) + value
 
         if len(data["data"]["allData"]) == 0:
             return None
         return data
+
+    @staticmethod
+    def daily_zone_keys(payload: dict) -> tuple[dict, dict]:
+        """Resolve day-local zone numbers before merging days or their labels."""
+        names = {str(k): v for k, v in payload.get("zonesName", {}).items()}
+        work = {str(k): v for k, v in (payload.get("workName") or {}).items()}
+        row_codes: dict[str, set[str]] = {}
+        tariffs: dict[str, set[str]] = {}
+        day_tariff = TauronAmiplusConnector.normalize_zone_tariff(payload.get("tariff"))
+        for row in payload.get("allData", []):
+            zone = str(row.get("Zone", ""))
+            code = str(row.get("WorkName") or "").strip().upper()
+            if code in {"T1", "T2", "T3"}:
+                row_codes.setdefault(zone, set()).add(code)
+            tariff = (
+                TauronAmiplusConnector.normalize_zone_tariff(row.get("Tariff"))
+                or TauronAmiplusConnector.normalize_zone_tariff(row.get("Taryfa"))
+            )
+            if tariff:
+                tariffs.setdefault(zone, set()).add(tariff)
+        day_tariffs = set().union(*tariffs.values())
+        if day_tariff:
+            day_tariffs.add(day_tariff)
+        # Never borrow the current tariff or a tariff from another day:
+        # the requested range can span a tariff change.
+        fallback_tariff = next(iter(day_tariffs)) if len(day_tariffs) == 1 else None
+        keys, labels = {}, {}
+        for zone in names.keys() | work.keys() | row_codes.keys() | tariffs.keys():
+            codes = row_codes.get(zone, set())
+            zone_tariffs = tariffs.get(zone, set())
+            if len(codes) > 1 or len(zone_tariffs) > 1:
+                # The daily total is keyed by the local number only; it
+                # cannot be safely assigned to any one of the conflicting zones.
+                key = f"unresolved_zone_{zone}"
+                keys[zone] = labels[key] = key
+                continue
+            code = next(iter(codes)) if codes else str(work.get(zone, "")).strip().upper()
+            if code not in {"T1", "T2", "T3"}:
+                match = re.search(r"(?:^T([1-3])$|\(T([1-3])\)$)", str(names.get(zone, "")).strip(), re.I)
+                if not match:
+                    keys[zone] = zone
+                    labels[zone] = names.get(zone, zone)
+                    continue
+                code = "T" + (match[1] or match[2])
+            tariff = next(iter(zone_tariffs)) if len(zone_tariffs) == 1 else fallback_tariff
+            key = f"{tariff}_{code}" if tariff else code
+            keys[zone] = labels[key] = key
+        return keys, labels
+
+    @staticmethod
+    def normalize_zone_tariff(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        value = value.strip().upper()
+        return value if value not in {"", "UNKNOWN", "UNAVAILABLE"} else None
 
     async def get_raw_values_daily_for_day(self, day: datetime.date | datetime.datetime, generation: bool):
         if isinstance(day, datetime.datetime):
